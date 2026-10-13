@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+supabase
+python-dotenv
+pydantic[email]
+langchain-community
+langchain-ollama
+langchain-text-splitters
+faiss-cpu
+pypdf
+pymupdf
+python-multipart
