@@ -1,9 +1,10 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict,EmailStr
 
 
 class ProfileCreate(BaseModel):
     name: str
-    email: str
+    # email: str
+    email: EmailStr
     github: str | None = None
     portfolio: str | None = None
     linkedin: str | None = None
