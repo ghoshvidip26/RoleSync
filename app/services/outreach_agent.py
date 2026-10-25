@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,7 +17,10 @@ from app.models.recipient import Recipient
 
 logger = logging.getLogger(__name__)
 
-INDEX_DIR = Path(os.getenv("INDEX_DIR", "data/indexes"))
+# Anchored to the project root, not the current directory, so indexes are found (and written to)
+# the same place however the app is launched. INDEX_DIR overrides it.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+INDEX_DIR = Path(os.getenv("INDEX_DIR", PROJECT_ROOT / "data" / "indexes"))
 CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "qwen:latest")
 EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 
@@ -47,17 +50,148 @@ def get_llm(temperature: float = 0.0) -> ChatOllama:
     return ChatOllama(model=CHAT_MODEL, temperature=temperature)
 
 
+# A single experience/project entry stays one document up to this size. Longer entries are
+# split between bullets, never inside one, and each part repeats the entry's header.
+MAX_ENTRY_CHARS = 1500
+
+_BULLET = re.compile(r"^\s*[•●▪◦·∙‣⁃*\-–—]\s+")
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+_LINK_LABELS = {"github", "gitlab", "live", "demo", "link", "website", "code", "source", "repo", "app", "web"}
+# Line-aligned splitting for unstructured resume text: chunks start at the beginning of a line.
+_raw_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=0, separators=["\n\n", "\n"])
+
+
+@dataclass
+class ParsedEntry:
+    """One experience or project entry: its header, its date line, and complete body lines."""
+
+    header: str
+    dates: str | None = None
+    lines: list[str] = field(default_factory=list)   # bullets are rendered as "• text"
+
+    def render(self, lines: list[str] | None = None) -> str:
+        head = [self.header] + ([self.dates] if self.dates else [])
+        return "\n".join(head + (self.lines if lines is None else lines))
+
+
+def normalize_entry_text(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("/n", "\n")
+
+
+def _is_date_line(line: str) -> bool:
+    return len(line) <= 45 and bool(_YEAR.search(line)) and bool(re.search(r"[–—·-]|present|current|\bto\b", line, re.I))
+
+
+def parse_entry(text: str) -> ParsedEntry:
+    """Split an entry into header / dates / body. A bullet that wraps onto the next line is joined
+    back into one complete bullet."""
+    raw = [l.strip() for l in normalize_entry_text(text).splitlines() if l.strip()]
+    entry = ParsedEntry(header=raw[0])
+    last_is_bullet = False
+    for line in raw[1:]:
+        if _BULLET.match(line):
+            entry.lines.append("• " + _BULLET.sub("", line).strip())
+            last_is_bullet = True
+        elif last_is_bullet:
+            entry.lines[-1] += " " + line          # wrapped continuation of the previous bullet
+        elif entry.dates is None and not entry.lines and _is_date_line(line):
+            entry.dates = line
+        else:
+            entry.lines.append(line)
+    return entry
+
+
+def experience_metadata(entry: ParsedEntry) -> dict[str, str]:
+    """job_title / company / dates, only when the header really says so (never guessed)."""
+    header, meta = entry.header, {}
+    parts = [p.strip() for p in header.split("|")]
+    if len(parts) >= 2 and parts[0] and parts[1]:
+        meta["job_title"], meta["company"] = parts[0], parts[1].split(",")[0].strip()
+    elif re.search(r"\s+at\s+", header, re.I):
+        title, rest = re.split(r"\s+at\s+", header, maxsplit=1, flags=re.I)
+        company = re.sub(r"\s*[(:].*$", "", rest).split(",")[0].strip()
+        if title.strip() and company:
+            meta["job_title"], meta["company"] = title.strip(), company
+    in_parens = re.search(r"\(([^)]*\d{4}[^)]*)\)", header)
+    dates = entry.dates or (in_parens.group(1).strip() if in_parens else None)
+    if dates:
+        meta["dates"] = dates
+    return meta
+
+
+
+def project_metadata(entry: ParsedEntry) -> dict[str, str]:
+    """Extract project name and technologies from a project heading."""
+    parts = [part.strip() for part in entry.header.split("|")]
+
+    name = parts[0]
+
+    # Remove prefixes such as "Project:" before extracting the name.
+    name = re.sub(r"^\s*project\s*:\s*", "", name, flags=re.IGNORECASE)
+    name = name.strip()
+
+    # Handle headings such as "StreamLite: Open-source engine"
+    if len(parts) == 1 and ":" in name:
+        name = name.split(":", 1)[0].strip()
+
+    meta: dict[str, str] = {}
+
+    if name and len(name.split()) <= 8 and not _BULLET.match(name):
+        meta["project_name"] = name
+
+        technologies = [
+            part
+            for part in parts[1:]
+            if part.lower() not in _LINK_LABELS
+            and not _is_date_line(part)
+        ]
+
+        if technologies:
+            meta["technologies"] = ", ".join(technologies)
+
+    return meta
+
+def _entry_documents(raw_entries: list[str], label: str, section: str, meta_fn) -> list[Document]:
+    """One Document per complete entry, prefixed with `label`, with accurate metadata. An entry
+    longer than MAX_ENTRY_CHARS is split between bullets and every part repeats the header."""
+    docs: list[Document] = []
+    for raw in raw_entries:
+        if not raw or not raw.strip():
+            continue
+        entry = parse_entry(raw)
+        meta = {"document_type": "profile", "source_section": section, **meta_fn(entry)}
+        parts = [entry.lines]
+        if len(entry.render()) > MAX_ENTRY_CHARS and len(entry.lines) > 1:
+            parts, current = [], []
+            for line in entry.lines:
+                if current and len(entry.render(current + [line])) > MAX_ENTRY_CHARS:
+                    parts.append(current)
+                    current = []
+                current.append(line)
+            parts.append(current)
+        for i, lines in enumerate(parts, 1):
+            docs.append(
+                Document(
+                    page_content=f"{label}: {entry.render(lines)}",
+                    metadata={**meta, "presplit": True, **({"part": f"{i}/{len(parts)}"} if len(parts) > 1 else {})},
+                )
+            )
+    return docs
+
+
 def build_documents_from_profile(profile: Profile, raw_text: str | None = None) -> list[Document]:
     """Build structured Documents with rich metadata from a validated profile and optional raw resume text."""
     docs: list[Document] = []
 
-    if profile.summary and profile.summary.strip():
-        docs.append(
-            Document(
-                page_content=f"Professional Summary: {profile.summary.strip()}",
-                metadata={"document_type": "profile", "source_section": "summary"},
-            )
+    def single(content: str, section: str) -> Document:
+        # Short items stay whole; only an unusually long one is left for index_resume to split.
+        return Document(
+            page_content=content,
+            metadata={"document_type": "profile", "source_section": section, "presplit": len(content) <= MAX_ENTRY_CHARS},
         )
+
+    if profile.summary and profile.summary.strip():
+        docs.append(single(f"Professional Summary: {normalize_entry_text(profile.summary)}", "summary"))
 
     all_skills = []
     if profile.programming_languages:
@@ -69,64 +203,25 @@ def build_documents_from_profile(profile: Profile, raw_text: str | None = None) 
     if profile.skills:
         all_skills.extend([f"Skills: {', '.join(profile.skills)}"])
     if all_skills:
-        docs.append(
-            Document(
-                page_content="\n".join(all_skills),
-                metadata={"document_type": "profile", "source_section": "skills"},
-            )
-        )
+        docs.append(single("\n".join(all_skills), "skills"))
 
-    if profile.experience:
-        for exp in profile.experience:
-            if exp and exp.strip():
-                docs.append(
-                    Document(
-                        page_content=f"Work Experience: {exp.strip()}",
-                        metadata={"document_type": "profile", "source_section": "experience"},
-                    )
-                )
+    docs.extend(_entry_documents(profile.experience or [], "Work Experience", "experience", experience_metadata))
+    docs.extend(_entry_documents(profile.projects or [], "Project", "projects", project_metadata))
 
-    if profile.projects:
-        for proj in profile.projects:
-            if proj and proj.strip():
-                proj_name = proj.split(":")[0].strip() if ":" in proj else "project"
-                docs.append(
-                    Document(
-                        page_content=f"Project: {proj.strip()}",
-                        metadata={
-                            "document_type": "profile",
-                            "source_section": "projects",
-                            "project_name": proj_name,
-                        },
-                    )
-                )
+    for ach in profile.achievements or []:
+        if ach and ach.strip():
+            docs.append(single(f"Quantifiable Achievement: {normalize_entry_text(ach)}", "achievements"))
 
-    if profile.achievements:
-        for ach in profile.achievements:
-            if ach and ach.strip():
-                docs.append(
-                    Document(
-                        page_content=f"Quantifiable Achievement: {ach.strip()}",
-                        metadata={"document_type": "profile", "source_section": "achievements"},
-                    )
-                )
-
-    if profile.education:
-        for edu in profile.education:
-            if edu and edu.strip():
-                docs.append(
-                    Document(
-                        page_content=f"Education: {edu.strip()}",
-                        metadata={"document_type": "profile", "source_section": "education"},
-                    )
-                )
+    for edu in profile.education or []:
+        if edu and edu.strip():
+            docs.append(single(f"Education: {normalize_entry_text(edu)}", "education"))
 
     if raw_text and raw_text.strip():
-        raw_chunks = splitter.create_documents(
+        for chunk in _raw_splitter.create_documents(
             [raw_text.strip()],
-            metadatas=[{"document_type": "resume", "source_section": "raw_resume"}],
-        )
-        docs.extend(raw_chunks)
+            metadatas=[{"document_type": "resume", "source_section": "raw_resume", "presplit": True}],
+        ):
+            docs.append(chunk)
 
     return docs
 
@@ -141,7 +236,10 @@ def index_resume(profile_id: str, documents: list[Document]) -> None:
         logger.warning("No valid documents provided to index for profile %s; skipping index build.", profile_id)
         return
 
-    document_chunks = splitter.split_documents(valid_docs)
+    # Entries built by build_documents_from_profile are already complete units; splitting them
+    # again at 500 characters is what cut experience and project entries in half.
+    whole = [doc for doc in valid_docs if doc.metadata.get("presplit")]
+    document_chunks = whole + splitter.split_documents([d for d in valid_docs if not d.metadata.get("presplit")])
     if not document_chunks:
         return
 

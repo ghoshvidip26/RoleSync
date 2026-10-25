@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+# Lets `python3 main.py` work even from inside app/: the `app.` imports below need the project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from datetime import datetime, timezone
 import logging
 from typing import Any
@@ -12,6 +18,8 @@ from app.models.profile import ExtractedProfile, Profile, ProfileCreate
 from app.models.recipient import Recipient, RecipientCreate
 from app.services import email_service, outreach_agent, resume_service
 from fastapi.middleware.cors import CORSMiddleware
+from app.agents.review import ReviewError, orchestrate
+from app.agents.resume_tailor import ResumeTailorError,tailor_resume
 
 logger = logging.getLogger(__name__)
 MAX_RESUME_BYTES = 5 * 1024 * 1024
@@ -208,3 +216,55 @@ def reject_email(email_id: str):
 
     updated = db.update(db.EMAILS, email_id, {"status": EmailStatus.REJECTED})
     return Email(**updated)
+
+class ProfileReviewRequest(BaseModel):
+    # profile_id: str
+    job_description: str
+
+@app.post('/profiles/{profile_id}/review')
+def review_profile(
+    profile_id: str,
+    data: ProfileReviewRequest,
+):
+    profile = db.fetch(db.PROFILES, profile_id)
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail="Profile not found",
+        )
+    
+    try:
+        return orchestrate(
+            profile_id=profile_id,
+            profile=profile,
+            job_description=data.job_description
+        )
+    except ReviewError as exc:
+        raise HTTPException(502, str(exc))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+class ResumeTailorRequest(BaseModel):
+    job_description: str
+
+@app.post("/profiles/{profile_id}/tailor-resume")
+def tailor_profile_resume(profile_id: str,data: ResumeTailorRequest):
+    profile = db.fetch(db.PROFILES,profile_id)
+    if not profile: 
+        raise HTTPException(status_code=404,
+            detail="Profile not found")
+    try:
+        return tailor_resume(
+            profile_id=profile_id,profile=profile,job_description=data.job_description
+        )
+    except ResumeTailorError as exc:
+        raise HTTPException(status_code=502,detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400,detail=str(exc))
+    
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

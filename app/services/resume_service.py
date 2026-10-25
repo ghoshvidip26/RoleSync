@@ -155,7 +155,7 @@ def splitEntries(section_text: str,starts_entry) -> list[str]:
     if current:
         entries.append(current)
     
-    return ["/n".join(entry) for entry in entries if entry]
+    return ["\n".join(entry) for entry in entries if entry]
 
 def extract_experience(section_text: str) -> list[str]: 
     def is_job_heading(line: str) -> bool:
@@ -497,18 +497,16 @@ def confirm_and_persist_profile(data: ProfileCreate) -> Profile:
     profile_dict = data.model_dump()
     profile_dict["id"] = profile_id
 
-    # If resume field is not populated, store raw text or summary as the resume field
-    if not profile_dict.get("resume"):
-        if hasattr(data, "raw_resume_text") and getattr(data, "raw_resume_text"):
-            profile_dict["resume"] = getattr(data, "raw_resume_text")
-        elif data.summary:
-            profile_dict["resume"] = data.summary
-
+    # db.insert keeps the structured fields (experience, projects, skills, ...) as JSON in the
+    # `resume` column, but only while `resume` is empty. Filling it with the summary here used to
+    # drop all of them, so the review agent later fetched a profile with no experience or projects.
     row = db.insert(db.PROFILES, profile_dict)
+    if str(row.get("resume") or "").lstrip().startswith("{"):
+        row = {**row, "resume": None}  # that JSON is internal storage, not a resume to show clients
     saved_profile = Profile(**row)
 
     # Build or update the user's resume retrieval index only after successful persistence
-    raw_resume_text = getattr(data, "raw_resume_text", None) or saved_profile.resume
+    raw_resume_text = getattr(data, "raw_resume_text", None)
     documents = outreach_agent.build_documents_from_profile(saved_profile, raw_text=raw_resume_text)
     if documents:
         try:
