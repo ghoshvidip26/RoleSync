@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INDEX_DIR = Path(os.getenv("INDEX_DIR", PROJECT_ROOT / "data" / "indexes"))
 CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "qwen:latest")
-EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:latest")
 
 splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 
@@ -251,10 +251,36 @@ def index_resume(profile_id: str, documents: list[Document]) -> None:
     logger.info("Indexed %d chunks for profile %s at %s", len(document_chunks), profile_id, out_dir)
 
 
+@lru_cache
+def _embedding_dimension() -> int:
+    """Length of the vectors the current embedding model produces (probed once per process)."""
+    return len(get_embeddings().embed_query("dimension probe"))
+
+
+def _built_with_current_model(vector_store: FAISS, profile_id: str) -> bool:
+    """False if the index holds vectors of a different size than the current embedding model makes,
+    i.e. it was built with another model and cannot be searched (FAISS would just assert)."""
+    try:
+        expected = _embedding_dimension()
+    except Exception:  # embedding service unreachable: skip the check, the search will report it
+        return True
+    if vector_store.index.d == expected:
+        return True
+    logger.warning(
+        "Index for profile %s holds %d-dimensional vectors but %s produces %d-dimensional ones. "
+        "It was built with a different embedding model; re-upload the resume to rebuild it.",
+        profile_id, vector_store.index.d, EMBEDDING_MODEL, expected,
+    )
+    return False
+
+
 def get_retriever(profile_id: str):
-    """Retriever over this profile's resume, or None if it has no resume index."""
+    """Retriever over this profile's resume, or None if it has no usable resume index."""
     if profile_id in _VECTOR_STORE_CACHE:
-        return _VECTOR_STORE_CACHE[profile_id].as_retriever(
+        cached = _VECTOR_STORE_CACHE[profile_id]
+        if not _built_with_current_model(cached, profile_id):
+            return None
+        return cached.as_retriever(
             search_type="similarity",
             search_kwargs={"k": 5},
         )
@@ -267,6 +293,8 @@ def get_retriever(profile_id: str):
         vector_store = FAISS.load_local(
             str(path), get_embeddings(), allow_dangerous_deserialization=True
         )
+        if not _built_with_current_model(vector_store, profile_id):
+            return None
         _VECTOR_STORE_CACHE[profile_id] = vector_store
         return vector_store.as_retriever(
             search_type="similarity",
