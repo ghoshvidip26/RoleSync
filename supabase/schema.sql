@@ -40,8 +40,26 @@ create table if not exists emails (
 
 create index if not exists emails_due_idx on emails (status, scheduled_at);
 
+-- Tailored resume drafts: saved when generated, reviewed (approved/rejected) by the user, and an
+-- approved draft can be used when generating a founder email.
+create table if not exists resume_drafts (
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references profiles(id),
+  job_description text not null,
+  draft jsonb not null,
+  status text not null default 'pending_review',
+  created_at timestamptz not null default now(),
+  reviewed_at timestamptz
+);
+
+create index if not exists resume_drafts_profile_idx on resume_drafts (profile_id, created_at desc);
+
+-- Which approved tailored resume an email was written from (null = the confirmed resume).
+alter table emails add column if not exists resume_draft_id uuid references resume_drafts(id);
+
 -- Only the backend (using the secret key, which bypasses RLS) should touch these tables.
 alter table profiles enable row level security;
 alter table companies enable row level security;
 alter table recipients enable row level security;
 alter table emails enable row level security;
+alter table resume_drafts enable row level security;

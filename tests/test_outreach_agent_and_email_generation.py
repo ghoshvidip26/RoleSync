@@ -50,8 +50,9 @@ def test_outreach_agent_draft_generation_with_links(sample_profile, sample_compa
         subject="Distributed Systems at Cyberdyne",
         body=(
             "Hi Miles,\n\n"
-            "I've been following Cyberdyne's work in AI infrastructure. With my background scaling "
-            "distributed systems and Kubernetes pipelines, I'd love to learn more about your engineering roadmap.\n\n"
+            "I build distributed systems in Python and run them on Kubernetes, and I'd love to learn how the "
+            "Director of Systems Engineering role approaches reliability at Cyberdyne Systems. "
+            "Would you be open to a short conversation?\n\n"
             "Best regards,\nSarah Connor\n"
             "GitHub: https://github.com/sarahconnor\n"
             "Portfolio: https://sarahconnor.dev\n"
@@ -86,12 +87,17 @@ def test_outreach_agent_missing_optional_links(sample_company, sample_recipient)
         portfolio=None,
         linkedin=None,
         summary="Backend developer.",
+        skills=["Python", "SQL"],
     )
 
     agent = OutreachAgent()
     mock_draft = _Draft(
         subject="Engineering at Cyberdyne",
-        body="Hi Miles,\n\nI admire your team's work.\n\nBest regards,\nJohn Doe",
+        body=(
+            "Hi Miles,\n\nI'm a backend developer who works mainly with Python and SQL, and I'd like to learn more "
+            "about the systems engineering work at Cyberdyne Systems. Would you be open to a short conversation "
+            "about where I could contribute?\n\nBest regards,\nJohn Doe"
+        ),
     )
 
     with patch("app.services.outreach_agent.get_retriever", return_value=None), \
@@ -126,7 +132,8 @@ def test_outreach_agent_fallback_parsing(sample_profile, sample_company, sample_
             "Subject: Opportunities at Cyberdyne Systems\n\n"
             "Body:\n"
             "Hi Miles,\n\n"
-            "Would love to connect regarding systems engineering.\n\n"
+            "I build distributed systems in Python and run them on Kubernetes, and I'd like to talk about "
+            "systems engineering at Cyberdyne Systems. Would you be open to a short chat?\n\n"
             "Best regards,\nSarah Connor"
         )
         mock_llm.invoke.return_value = mock_fallback_resp

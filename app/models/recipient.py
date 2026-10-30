@@ -1,9 +1,9 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr
 
 
 class RecipientCreate(BaseModel):
     name: str | None = None
-    email: str
+    email: EmailStr
     role: str | None = None
 
 

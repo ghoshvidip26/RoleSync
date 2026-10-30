@@ -35,3 +35,4 @@ class Email(BaseModel):
     scheduled_at: datetime | None = None
     sent_at: datetime | None = None
     error: str | None = None
+    resume_draft_id: str | None = None

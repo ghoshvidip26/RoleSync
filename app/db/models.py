@@ -10,6 +10,7 @@ PROFILES = "profiles"
 COMPANIES = "companies"
 RECIPIENTS = "recipients"
 EMAILS = "emails"
+RESUME_DRAFTS = "resume_drafts"
 
 KNOWN_COLUMNS: dict[str, set[str]] = {
     PROFILES: {"id", "name", "email", "github", "portfolio", "linkedin", "resume"},
@@ -26,6 +27,7 @@ KNOWN_COLUMNS: dict[str, set[str]] = {
         "scheduled_at",
         "sent_at",
         "error",
+        "resume_draft_id",
     },
 }
 

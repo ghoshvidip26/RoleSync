@@ -1,3 +1,4 @@
+from pydantic import Field
 import sys
 from pathlib import Path
 
@@ -9,16 +10,18 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.db import models as db
 from app.models.company import Company, CompanyCreate
 from app.models.email import Email, EmailStatus
 from app.models.profile import ExtractedProfile, Profile, ProfileCreate
 from app.models.recipient import Recipient, RecipientCreate
+from app.models.resume_draft import ResumeDraftRecord, ResumeDraftStatus
 from app.services import email_service, outreach_agent, resume_service
 from fastapi.middleware.cors import CORSMiddleware
 from app.agents.review import ReviewError, orchestrate
+from app.agents.tailoring_decision import needs_tailoring
 from app.agents.resume_tailor import ResumeTailorError,tailor_resume
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,7 @@ class OutreachRequest(BaseModel):
     profile_id: str
     company_id: str
     recipient_id: str
+    resume_draft_id: str | None = None  # an APPROVED tailored resume to write from; omit to use the confirmed resume
 
 
 def _get_entity(table: str, id_: str) -> dict[str, Any]:
@@ -125,7 +129,26 @@ def create_outreach(req: OutreachRequest):
 
     profile = Profile(**profile_dict)
     company = Company(**company_dict)
-    recipient = Recipient(**recipient_dict)
+    try:
+        recipient = Recipient(**recipient_dict)
+    except ValidationError:
+        # A recipient saved before addresses were validated: fail now, not after the email is approved.
+        raise HTTPException(
+            422,
+            f"Recipient {req.recipient_id} has an invalid email address ({recipient_dict.get('email')!r}). "
+            "Fix the recipient before generating outreach.",
+        )
+
+    tailored = None
+    if req.resume_draft_id:
+        draft_record = _get_resume_draft(req.resume_draft_id)
+        if draft_record.profile_id != req.profile_id:
+            raise HTTPException(409, "That tailored resume belongs to a different profile")
+        if draft_record.status != ResumeDraftStatus.APPROVED:
+            raise HTTPException(
+                409, f"Only an approved tailored resume can be used (current: {draft_record.status.value})"
+            )
+        tailored = draft_record.draft
 
     # Insert draft entry
     row = db.insert(
@@ -135,12 +158,14 @@ def create_outreach(req: OutreachRequest):
             "company_id": req.company_id,
             "recipient_id": req.recipient_id,
             "status": EmailStatus.GENERATING,
+            # Only sent when used, so outreach keeps working before the emails.resume_draft_id column exists.
+            **({"resume_draft_id": req.resume_draft_id} if tailored else {}),
         },
     )
     email_id = row["id"]
 
     try:
-        draft = agent.run(profile, company, recipient)
+        draft = agent.run(profile, company, recipient, tailored=tailored)
         updated = db.update(
             db.EMAILS,
             email_id,
@@ -234,7 +259,7 @@ def review_profile(
         )
     
     try:
-        return orchestrate(
+        result = orchestrate(
             profile_id=profile_id,
             profile=profile,
             job_description=data.job_description
@@ -243,9 +268,30 @@ def review_profile(
         raise HTTPException(502, str(exc))
     except ValueError as exc:
         raise HTTPException(409, str(exc))
+    result["tailoring"] = needs_tailoring(profile, data.job_description)
+    return result
 
 class ResumeTailorRequest(BaseModel):
     job_description: str
+
+def _save_resume_draft(profile_id: str, job_description: str, draft: dict) -> str | None:
+    """Save the generated draft so it can be reviewed. If it cannot be saved (e.g. the resume_drafts
+    table has not been created yet), the draft is still returned, without an id."""
+    try:
+        row = db.insert(
+            db.RESUME_DRAFTS,
+            {
+                "profile_id": profile_id,
+                "job_description": job_description,
+                "draft": draft,
+                "status": ResumeDraftStatus.PENDING_REVIEW,
+            },
+        )
+        return row["id"]
+    except Exception as exc:
+        logger.warning("Could not save the tailored resume draft (is the resume_drafts table created?): %s", exc)
+        return None
+
 
 @app.post("/profiles/{profile_id}/tailor-resume")
 def tailor_profile_resume(profile_id: str,data: ResumeTailorRequest):
@@ -254,14 +300,94 @@ def tailor_profile_resume(profile_id: str,data: ResumeTailorRequest):
         raise HTTPException(status_code=404,
             detail="Profile not found")
     try:
-        return tailor_resume(
+        result = tailor_resume(
             profile_id=profile_id,profile=profile,job_description=data.job_description
         )
     except ResumeTailorError as exc:
         raise HTTPException(status_code=502,detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400,detail=str(exc))
-    
+    result["draft_id"] = _save_resume_draft(profile_id, data.job_description, result["draft"])
+    return result
+
+
+def _draft_db(call, *args, **kwargs):
+    """Run a resume_drafts query; a missing table becomes a clear 503 instead of a raw database error."""
+    try:
+        return call(*args, **kwargs)
+    except Exception as exc:
+        if "PGRST205" in str(exc) or "resume_drafts" in str(exc):
+            raise HTTPException(
+                503,
+                "The resume_drafts table does not exist yet. Run the resume_drafts section of "
+                "supabase/schema.sql in the Supabase SQL editor.",
+            ) from exc
+        raise
+
+
+def _get_resume_draft(draft_id: str) -> ResumeDraftRecord:
+    row = _draft_db(db.fetch, db.RESUME_DRAFTS, draft_id)
+    if row is None:
+        raise HTTPException(404, f"Resume draft {draft_id} not found")
+    return ResumeDraftRecord(**row)
+
+
+@app.get("/profiles/{profile_id}/resume-drafts", response_model=list[ResumeDraftRecord])
+def list_resume_drafts(profile_id: str):
+    """A profile's tailored resume drafts, newest first."""
+    rows = _draft_db(db.fetch_all, db.RESUME_DRAFTS, profile_id=profile_id)
+    return sorted((ResumeDraftRecord(**r) for r in rows), key=lambda r: str(r.created_at or ""), reverse=True)
+
+
+@app.get("/resume-drafts/{draft_id}", response_model=ResumeDraftRecord)
+def get_resume_draft(draft_id: str):
+    return _get_resume_draft(draft_id)
+
+
+def _review_resume_draft(draft_id: str, status: ResumeDraftStatus) -> ResumeDraftRecord:
+    record = _get_resume_draft(draft_id)
+    if record.status != ResumeDraftStatus.PENDING_REVIEW:
+        raise HTTPException(409, f"Only drafts pending review can be {status.value} (current: {record.status.value})")
+    updated = _draft_db(
+        db.update, db.RESUME_DRAFTS, draft_id, {"status": status, "reviewed_at": datetime.now(timezone.utc)}
+    )
+    return ResumeDraftRecord(**updated)
+
+
+@app.post("/resume-drafts/{draft_id}/approve", response_model=ResumeDraftRecord)
+def approve_resume_draft(draft_id: str):
+    return _review_resume_draft(draft_id, ResumeDraftStatus.APPROVED)
+
+
+@app.post("/resume-drafts/{draft_id}/reject", response_model=ResumeDraftRecord)
+def reject_resume_draft(draft_id: str):
+    return _review_resume_draft(draft_id, ResumeDraftStatus.REJECTED)
+
+class ResumeDraftEdit(BaseModel):
+    """The fields a user may change while reviewing a draft. A field that is not sent is left alone;
+    a field sent as null or as blank text is cleared."""
+
+    headline: str | None = Field(default=None, max_length=120)
+    summary: str | None = Field(default=None, max_length=350)
+
+
+@app.patch("/resume-drafts/{draft_id}", response_model=ResumeDraftRecord)
+def edit_resume_draft(draft_id: str, data: ResumeDraftEdit):
+    """Edit the headline and/or summary of a draft that is still pending review."""
+    changes = data.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(422, "Send at least one of: headline, summary")
+
+    record = _get_resume_draft(draft_id)
+    if record.status != ResumeDraftStatus.PENDING_REVIEW:
+        raise HTTPException(409, f"Only drafts pending review can be edited (current: {record.status.value})")
+
+    new_draft = {
+        **record.draft,
+        **{field: (value or "").strip() or None for field, value in changes.items()},
+    }
+    updated = _draft_db(db.update, db.RESUME_DRAFTS, draft_id, {"draft": new_draft})
+    return ResumeDraftRecord(**updated)
 
 
 if __name__ == "__main__":
