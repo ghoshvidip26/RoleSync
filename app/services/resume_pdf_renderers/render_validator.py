@@ -297,7 +297,15 @@ def validate_rendering(
                              "Sections appear in the original order" if not out_of_order
                              else "Section headings are missing or out of order", problems=out_of_order))
 
-        orig_links = [l["uri"] for p in orig for l in p.get_links() if l.get("uri")]
+        # A link is required only while the words it sat on are still in the resume: removing a project on purpose
+        # removes its link too, and that is not a loss.
+        orig_links = []
+        for p in orig:
+            for l in p.get_links():
+                if l.get("uri"):
+                    anchor = _n(p.get_textbox(pymupdf.Rect(l["from"])))
+                    if not anchor or anchor in flat:
+                        orig_links.append(l["uri"])
         gen_links = [l["uri"] for p in gen for l in p.get_links() if l.get("uri")]
         lost = [u for u in orig_links if u not in gen_links]
         checks.append(_check("links_preserved", "pass" if not lost else "fail",

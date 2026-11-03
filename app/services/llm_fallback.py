@@ -112,7 +112,7 @@ class _StructuredFallback:
                 return self.schema.model_validate_json(content)
             except Exception as groq_exc:
                 logger.warning("Groq fallback failed too: %s", _brief(groq_exc))
-                raise exc from None
+                raise _both_failed(exc, groq_exc) from None
 
 
 class FallbackChat:
@@ -137,13 +137,18 @@ class FallbackChat:
                 return groq_invoke(messages, format)
             except Exception as groq_exc:
                 logger.warning("Groq fallback failed too: %s", _brief(groq_exc))
-                raise exc from None
+                raise _both_failed(exc, groq_exc) from None
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> _StructuredFallback:
         return _StructuredFallback(self.primary.with_structured_output(schema, **kwargs), schema, self)
 
     def __getattr__(self, name: str) -> Any:        # anything else (model name, ...) comes from the local model
         return getattr(self.primary, name)
+
+
+def _both_failed(local_exc: Exception, groq_exc: Exception) -> RuntimeError:
+    """One error that says what went wrong locally and why the cloud fallback could not help either."""
+    return RuntimeError(f"{_brief(local_exc)} (the Groq fallback failed too: {_brief(groq_exc)})")
 
 
 def _brief(exc: Exception) -> str:

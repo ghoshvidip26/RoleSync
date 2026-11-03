@@ -1,4 +1,4 @@
-# Founders Outreach: frontend
+# RoleSync: frontend
 
 A step-by-step web app on top of the FastAPI backend: upload a resume, confirm the profile, paste a job,
 check the fit, review and approve the tailored resume, choose an ATS-safe design, then write, review and send

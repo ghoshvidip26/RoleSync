@@ -40,7 +40,7 @@ from app.services.resume_pdf_renderers.template_renderer import preview_png
 logger = logging.getLogger(__name__)
 MAX_RESUME_BYTES = 5 * 1024 * 1024
 
-app = FastAPI(title="Founders Outreach")
+app = FastAPI(title="RoleSync")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

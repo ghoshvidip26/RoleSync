@@ -70,7 +70,7 @@ def test_without_a_tailored_resume_the_prompt_is_unchanged():
 def test_the_fallback_template_leads_with_the_tailored_skills_and_result():
     draft = oa._template_email(PROFILE, COMPANY, RECIPIENT, TAILORED)
     assert "I work mainly with Redis, PostgreSQL and Docker." in draft.body
-    assert "• Cut query latency 45% with a Redis caching layer in front of PostgreSQL" in draft.body
+    assert "• At PayLoop: Cut query latency 45% with a Redis caching layer in front of PostgreSQL" in draft.body
     plain = oa._template_email(PROFILE, COMPANY, RECIPIENT)
     assert "I work mainly with Python, Kubernetes, PostgreSQL, Redis and Docker." in plain.body          # no draft: as before
 
@@ -194,7 +194,7 @@ def test_an_approved_current_draft_changes_the_email_prompt_and_the_template():
     assert "Skills to emphasise: Redis, PostgreSQL, Docker" in prompt and "Projects to mention: StreamLite, LedgerCheck" in prompt
     assert "A result to mention: Cut query latency 45%" in prompt and "Terraform" not in prompt
     body = oa._template_email(PROFILE, COMPANY, RECIPIENT, NEW_SHAPE).body
-    assert "I work mainly with Redis, PostgreSQL and Docker." in body and "• Cut query latency 45%" in body
+    assert "I work mainly with Redis, PostgreSQL and Docker." in body and "• At PayLoop: Cut query latency 45%" in body
 
 
 def test_an_empty_or_unrelated_dict_adds_nothing():

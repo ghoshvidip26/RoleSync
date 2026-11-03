@@ -525,35 +525,106 @@ def _tailored_facts(tailored: dict | None) -> dict:
     }
 
 
+_BREAK_WORDS = (" to ", " using ", " by ", " for ", " with ", " via ", " across ", " while ", " so ", " that ", " and ")
+
+
 def _clause_cut(text: str, limit: int) -> str:
-    """`text` cut at the last comma or semicolon before `limit` (no ellipsis), without a final period."""
+    """`text` cut at a natural break before `limit`, without a final period or an ellipsis. In order of preference:
+    the last comma or semicolon, then the last " to / using / by / for / with ..." (so the rest is dropped as a
+    whole clause), then a word. Breaks inside parentheses are never used, and a parenthesis left open by the cut
+    is dropped."""
     text = " ".join(text.split()).rstrip(".")
     if len(text) <= limit:
         return text
-    head = text[:limit]
-    cut = max(head.rfind(", "), head.rfind("; "))
-    return (head[:cut] if cut > limit // 2 else head.rsplit(" ", 1)[0]).rstrip(",;: ")
+    head, depth, comma, clause = text[:limit], 0, -1, -1
+    for i, ch in enumerate(head):
+        depth += (ch == "(") - (ch == ")" and depth > 0)
+        if depth:
+            continue
+        if head[i:i + 2] in (", ", "; "):
+            comma = i
+        elif any(head.startswith(w, i) for w in _BREAK_WORDS):
+            clause = i
+    if comma > limit // 2:
+        out = head[:comma]
+    elif clause > limit // 2:
+        out = head[:clause]
+    else:
+        out = head.rsplit(" ", 1)[0]
+    if out.count("(") > out.count(")"):                       # "...flows (pickup, delivery" -> "...flows"
+        out = out[: out.rindex("(")]
+    return out.rstrip(",;: ")
+
+
+def _tidy_note(note: str) -> str:
+    """The personal line as the candidate wrote it, made safe to put in front of the intro: stray trailing
+    symbols are dropped and it ends like a sentence ("I'm looking for SWE-1/" -> "I'm looking for SWE-1.")."""
+    note = " ".join(note.split()).rstrip("/\\|,;:-– ")
+    if not note:
+        return ""
+    note = note[0].upper() + note[1:]
+    return note if note.endswith((".", "!", "?")) else note + "."
 
 
 # --- The email: greeting, 2 written paragraphs, proof of work, closing. Code builds everything but the paragraphs. ---
 
 CLOSING_REGARDS = "Thanks & Regards,"
-PROOF_HEADING = "Some relevant work:"
-MAX_PROOF_CHARS = 190
+PROOF_HEADING = "A few relevant things I've worked on:"
+MAX_PROOF_CHARS = 230     # one whole proof line: project or employer, the resume's own sentence, and the tech stack
+
+# Words that signal a field, and the words in a resume that show work in it. Plain data: add a line to teach the
+# ranking a new field. It only decides WHICH of the candidate's real projects and roles to show first; none of
+# these words is ever written into an e-mail.
+DOMAIN_HINTS = {
+    "ai": "llm llms rag agent agents embedding embeddings langchain langgraph faiss gemini openai prompt ml nlp vector retrieval semantic qdrant",
+    "ml": "llm rag embedding model training pytorch tensorflow nlp vector retrieval ai",
+    "data": "pipeline etl analytics sql postgresql mongodb warehouse kafka spark",
+    "fintech": "payment payments razorpay upi wallet cashfree stripe checkout settlement",
+    "payments": "payment razorpay upi wallet cashfree stripe checkout settlement",
+    "mobile": "react native android ios firebase fcm expo geofence location",
+    "cloud": "aws gcp azure docker kubernetes terraform serverless",
+    "devops": "docker kubernetes ci cd github actions terraform sre incident deployment",
+    "security": "auth authentication oauth jwt encryption vulnerability",
+    "health": "patient clinical hipaa",
+}
+
+
+_NOT_A_NAME = {"hi", "hello", "hey", "dear", "team", "there", "sir", "madam", "mr", "mrs", "ms", "dr", "mr.", "mrs.", "ms.", "dr."}
+
+
+def _first_name(recipient: Recipient) -> str | None:
+    """The recipient's first name, or None when what was entered is not a usable name (e.g. "Hi", "hr@x.com",
+    "Hello Team"): a greeting word is skipped, and anything that is not a plain word gives None."""
+    words = [w.strip(",.;:") for w in (recipient.name or "").split()]
+    while words and words[0].lower() in _NOT_A_NAME:        # "Hi Miles" -> "Miles"; "Dr Dyson" keeps "Dyson" too
+        words.pop(0)
+    first = words[0] if words else ""
+    if not re.fullmatch(r"[^\W\d_]+(?:[-'’][^\W\d_]+)*", first):   # letters only (hyphen/apostrophe inside is fine)
+        return None
+    return first.capitalize() if first.islower() or first.isupper() else first
 
 
 def _greeting(recipient: Recipient, company: Company) -> str:
-    first = recipient.name.split()[0] if recipient.name else None
+    first = _first_name(recipient)
     return f"Hi {first}," if first else f"Hi {company.name} Team,"
 
 
 def _current_role(profile: Profile) -> tuple[str | None, str | None]:
     """(job title, employer) of the first experience entry that states both."""
+    title, employer, _ = _current_role_with_dates(profile)
+    return title, employer
+
+
+_STILL_THERE = re.compile(r"\b(?:present|current|currently|now|ongoing|today)\b", re.I)
+
+
+def _current_role_with_dates(profile: Profile) -> tuple[str | None, str | None, bool]:
+    """(job title, employer, is that job still going on?) of the first experience entry that states both."""
     for raw in profile.experience or []:
         meta = experience_metadata(parse_entry(raw))
         if meta.get("job_title") and meta.get("company"):
-            return meta["job_title"], meta["company"]
-    return None, None
+            return meta["job_title"], meta["company"], bool(_STILL_THERE.search(meta.get("dates", "")))
+    return None, None, False
 
 
 def _subject(profile: Profile, company: Company, title: str | None) -> str:
@@ -595,45 +666,125 @@ def _join_list(items: list[str]) -> str:
     return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}" if items else ""
 
 
-def _proof_points(profile: Profile, company: Company, recipient: Recipient, tailored: dict | None,
-                  limit: int = 2, skip_text: str = "", exclude: list[str] | None = None) -> list[str]:
-    """The best proof of work: real bullets from the resume, never rewritten. From the approved tailored
-    resume when there is one (its order is already by relevance), else the bullets that best match the
-    recipient's role and the company; results with numbers come first among equals."""
+_WORDS = re.compile(r"[^A-Za-z0-9+#]+")
+_ADDRESS_NOISE = {"http", "https", "www", "com", "org", "net", "io", "co", "in", "app", "dev"}      # "ai" is deliberately not noise
+
+
+def _wanted_terms(company: Company, recipient: Recipient, tailored: dict | None, note: str | None) -> set[str]:
+    """Stems that say what this email is for: the company (name and web address, so "gnani.ai" gives "ai"),
+    the recipient's role, the candidate's own personal line and the approved tailored resume's skills and headline.
+    A field word such as "ai" also brings in the words that show work in that field (DOMAIN_HINTS)."""
     facts = _tailored_facts(tailored)
-    wanted = _stems(f"{recipient.role or ''} {company.name} {company.website or ''} {' '.join(facts['skills'])}")
-    pool: list[str] = list(facts["bullets"])
-    if not pool:
-        for raw in [*(profile.experience or []), *(profile.projects or [])]:
-            entry = [l.lstrip("• ").strip() for l in parse_entry(raw).lines if l.lstrip("• ").strip()]
-            if entry:           # one candidate per entry, so the proof comes from different work
-                pool.append(max(entry, key=lambda b: (len(_stems(b) & wanted), bool(_NUMBER_RE.search(b)), -len(b))))
+    raw = " ".join([company.name, company.website or "", recipient.role or "", note or "", " ".join(facts["skills"]),
+                    str((tailored or {}).get("headline") or "")])
+    stems = {_stem(w) for w in _WORDS.split(raw) if len(w) > 1 and w.lower() not in _ADDRESS_NOISE}
+    for field, hint in DOMAIN_HINTS.items():
+        if _stem(field) in stems:
+            stems |= _stems(hint)
+    return stems
+
+
+def _evidence(profile: Profile, tailored: dict | None) -> list[dict]:
+    """The candidate's real projects and roles as {kind, label, tech, bullets}. From the approved tailored
+    resume when it has them (the candidate approved those words, in order of relevance), else from the profile."""
+    items: list[dict] = []
+    clean = lambda xs: [str(x).strip() for x in xs or [] if isinstance(x, str) and str(x).strip()]
+    t = tailored or {}
+    t_work = [e for e in t.get("experience") or [] if isinstance(e, dict)]
+    t_projects = [e for e in t.get("projects") or [] if isinstance(e, dict)]
+    if t_work or t_projects:
+        for e in t_work:
+            if clean(e.get("bullets")):
+                items.append({"kind": "work", "label": str(e.get("company") or "").strip(), "tech": [], "bullets": clean(e["bullets"])})
+        for e in t_projects:
+            if clean(e.get("bullets")) and str(e.get("name") or "").strip():
+                items.append({"kind": "project", "label": str(e["name"]).strip(), "tech": clean(e.get("technologies")), "bullets": clean(e["bullets"])})
+        return items
+    for raw in profile.experience or []:
+        entry = parse_entry(raw)
+        bullets = [l.lstrip("• ").strip() for l in entry.lines if l.lstrip("• ").strip()]
+        if bullets:
+            items.append({"kind": "work", "label": experience_metadata(entry).get("company", ""), "tech": [], "bullets": bullets})
+    for raw in profile.projects or []:
+        entry = parse_entry(raw)
+        meta = project_metadata(entry)
+        bullets = [l.lstrip("• ").strip() for l in entry.lines if l.lstrip("• ").strip()]
+        if bullets and meta.get("project_name"):
+            items.append({"kind": "project", "label": meta["project_name"], "tech": [t.strip() for t in meta.get("technologies", "").split(",") if t.strip()], "bullets": bullets})
+    return items
+
+
+def _proof_line(item: dict, bullet: str) -> str:
+    """"StackSearch: Achieved sub-100 ms retrieval over 2,500+ documentation pages using Node.js, LangChain and FAISS"
+    or "At Aforro: Delivered 6 rider order flows". The sentence is the resume's own, cut at a clause; the stack is
+    the project's own technology list (the first five)."""
+    prefix = f"{item['label']}: " if item["kind"] == "project" else (f"At {item['label']}: " if item["label"] else "")
+    suffix = f" using {_join_list(item['tech'][:5])}" if item["tech"] else ""
+    room = max(60, MAX_PROOF_CHARS - len(prefix) - len(suffix))
+    return f"{prefix}{_clause_cut(bullet, room)}{suffix}"
+
+
+def _proof_points(profile: Profile, company: Company, recipient: Recipient, tailored: dict | None,
+                  limit: int = 3, skip_text: str = "", exclude: list[str] | None = None, note: str | None = None) -> list[str]:
+    """The best proof of work: the candidate's real projects (with their tech stacks) and roles, ranked by how
+    well they fit this company, the recipient's role, the personal line and the tailored resume. Two projects and
+    a role by default, projects first. Each line is a sentence from the resume, cut at a clause, never rewritten."""
+    wanted = _wanted_terms(company, recipient, tailored, note)
     covered = _stems(skip_text)
-    chosen: list[str] = []
-    ranked = sorted(enumerate(pool), key=lambda ib: (-len(_stems(ib[1]) & wanted) if not facts["bullets"] else ib[0],
-                                                     -bool(_NUMBER_RE.search(ib[1])), ib[0]))
-    for _, bullet in ranked:
+
+    def best_bullet(item: dict) -> str:
+        return max(enumerate(item["bullets"]), key=lambda ib: (len(_stems(ib[1]) & wanted), bool(_NUMBER_RE.search(ib[1])), -ib[0]))[1]
+
+    ranked: dict[str, list[tuple[dict, str]]] = {"project": [], "work": []}
+    for index, item in sorted(enumerate(_evidence(profile, tailored)),
+                              key=lambda ie: (-len(_stems(" ".join([ie[1]["label"], *ie[1]["tech"], *ie[1]["bullets"]])) & wanted), ie[0])):
+        ranked[item["kind"]].append((item, best_bullet(item)))
+
+    order: list[tuple[dict, str]] = []                      # best project, best role, second project, second role, ...
+    for i in range(max(len(ranked["project"]), len(ranked["work"]))):
+        order += [ranked[k][i] for k in ("project", "work") if i < len(ranked[k])]
+
+    chosen: list[tuple[dict, str]] = []
+    for item, bullet in order:
         words = _stems(bullet)
+        line = _proof_line(item, bullet)
         if words and len(words & covered) / len(words) > 0.7:      # the written paragraphs already say this
             continue
-        cut = _clause_cut(bullet, MAX_PROOF_CHARS)
-        if cut in (exclude or []):                                  # already shown elsewhere in this email
+        if line in (exclude or []) or any(line == l for _, l in chosen):
             continue
-        if cut and cut not in chosen:
-            chosen.append(cut)
+        chosen.append((item, line))
         if len(chosen) == limit:
             break
-    return chosen
+    chosen.sort(key=lambda pair: pair[0]["kind"] != "project")       # projects first, then the role (stable otherwise)
+    return [line for _, line in chosen]
+
+
+def _summary_sentence(profile: Profile) -> str:
+    """The resume's own summary as a first-person sentence: "Software engineer with 1 year of experience shipping
+    mobile and AI features." -> "I have 1 year of experience shipping mobile and AI features." Empty when the
+    summary does not have that shape (nothing is guessed)."""
+    text = " ".join((profile.summary or "").split())
+    first = re.split(r"(?<=[.!?])\s+", text)[0].rstrip(".!?") if text else ""
+    if re.match(r"(?i)^(?:i|i'm|i’m|i've|i’ve|we|my|our)\b", first):        # already first person: "I build things with care"
+        return ""
+    m = re.match(r"^(?:an?\s+)?[A-Za-z][A-Za-z /&-]{2,40}?\s+with\s+(?P<rest>.{15,})$", first)
+    return f"I have {m['rest']}." if m else ""
 
 
 def _template_paragraphs(profile: Profile, tailored: dict | None) -> list[str]:
     """Intro and expertise paragraphs built only from the candidate's real background."""
-    title, employer = _current_role(profile)
+    title, employer, ongoing = _current_role_with_dates(profile)
     first = profile.name.split()[0]
-    intro = f"I'm {first}."
-    if title and employer:
-        article = "an" if title[0].lower() in "aeiou" else "a"
-        intro += f" Most recently I've worked as {article} {title} at {employer}."
+    article = "an" if title and title[0].lower() in "aeiou" else "a"
+    if title and employer and ongoing:
+        intro = f"I'm {first}, currently {article} {title} at {employer}."
+    elif title and employer:
+        intro = f"I'm {first}. Most recently I've worked as {article} {title} at {employer}."
+    else:
+        intro = f"I'm {first}."
+    summary = _summary_sentence(profile)
+    if summary:
+        intro += f" {summary}"
     skills = _expertise_skills(profile, tailored)     # the approved tailored resume decides what to lead with
     paragraphs = [intro]
     if skills:
@@ -646,8 +797,9 @@ def _assemble(profile: Profile, company: Company, recipient: Recipient, paragrap
               note: str | None = None) -> str:
     """greeting, paragraphs, proof of work, any answered questions, closing, sign-off."""
     paragraphs = [p.strip() for p in paragraphs if p and p.strip()]
-    if note and note.strip():                   # the candidate's own words, used as written
-        paragraphs = [f"{note.strip()} {paragraphs[0]}" if paragraphs else note.strip(), *paragraphs[1:]]
+    note = _tidy_note(note or "")
+    if note:                                    # the candidate's own words, with only the ending tidied
+        paragraphs = [f"{note} {paragraphs[0]}" if paragraphs else note, *paragraphs[1:]]
     out = [_greeting(recipient, company), ""]
     for p in paragraphs:
         out += [p, ""]
@@ -669,7 +821,7 @@ def _template_email(profile: Profile, company: Company, recipient: Recipient, ta
     """A plain email built only from the candidate's real background and the details we were given."""
     title, _ = _current_role(profile)
     paragraphs = _template_paragraphs(profile, tailored)
-    proof = _proof_points(profile, company, recipient, tailored, skip_text=" ".join(paragraphs))
+    proof = _proof_points(profile, company, recipient, tailored, skip_text=" ".join(paragraphs), note=note)
     body = _assemble(profile, company, recipient, paragraphs, proof, bool(tailored), sections, note)
     return DraftEmail(subject=_subject(profile, company, title), body=body)
 
@@ -686,7 +838,7 @@ def _template_answer(profile: Profile, company: Company, recipient: Recipient, t
     else:
         answer = f"I have hands-on experience in {_join_list(skills)}." if skills else f"I'm {first}."
     answer += f" I'd be glad to put that experience to work at {company.name}."
-    return answer, _proof_points(profile, company, recipient, tailored, limit=3, exclude=shown)
+    return answer, _proof_points(profile, company, recipient, tailored, limit=2, exclude=shown)
 
 
 RESUME_NOTE = "I've attached my resume for reference."
@@ -857,7 +1009,7 @@ class OutreachAgent:
             paragraphs = _template_paragraphs(profile, tailored)
         subject = subject or _subject(profile, company, title)
 
-        proof = _proof_points(profile, company, recipient, tailored, skip_text=" ".join(paragraphs))
+        proof = _proof_points(profile, company, recipient, tailored, skip_text=" ".join(paragraphs), note=personal_note)
         sections, shown = [], list(proof)
         for q in (questions or []):
             answer, bullets = self._answer(llm, q, profile, company, recipient, tailored, evidence, context,
@@ -889,7 +1041,7 @@ class OutreachAgent:
             if "\n" in text or not text:
                 raise ValueError("answer must be a single paragraph")
             _verify_email(_Draft(subject="answer", body=text), profile, company, recipient, evidence)
-            return text, _proof_points(profile, company, recipient, tailored, limit=3, skip_text=text, exclude=shown)
+            return text, _proof_points(profile, company, recipient, tailored, limit=2, skip_text=text, exclude=shown)
         except Exception as exc:
             logger.warning("Model-written answer not used (grounded answer used instead): %s", exc)
             return _template_answer(profile, company, recipient, tailored, shown)

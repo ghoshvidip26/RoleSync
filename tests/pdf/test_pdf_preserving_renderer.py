@@ -252,3 +252,45 @@ def test_a_real_font_file_extracts_with_plain_spaces_and_hyphens():
     _fix_text_maps(doc)
     text = page.get_text()
     assert "real-time React Native" in text and " " not in text and "‐" not in text
+
+
+# ------------------------------- the user's own design must survive ordinary edits (found by trying edits on a real resume)
+
+def _edited(pdf, change):
+    draft = identity_draft(grouped(pdf))
+    change(draft)
+    out, report = render(pdf, draft)
+    return out, report, draft
+
+
+def _lowest_text(pdf):
+    with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+        return [max(w[3] for w in page.get_text("words")) for page in doc]
+
+
+def test_text_stays_inside_the_page_even_when_content_is_added_until_it_overflows():
+    pdf = design_c()                                         # a short resume on a tall page: it may grow to fill the page
+    out, report, _ = _edited(pdf, lambda d: d["experience"][0]["bullets"].extend(
+        ["An additional supporting bullet that fills lines of the page with more content"] * 90))
+    with pymupdf.open(stream=out, filetype="pdf") as doc:
+        assert doc.page_count > 1
+        for page in doc:
+            assert max(w[3] for w in page.get_text("words")) <= page.rect.height - 25, "text runs into the bottom margin"
+
+
+@pytest.mark.skipif(not (FIXTURES / "Vidip_Resume.pdf").exists(), reason="sample resume not present")
+@pytest.mark.parametrize("name, change", [
+    ("a project removed", lambda d: d["projects"].pop()),
+    ("a role removed", lambda d: d["experience"].pop()),
+    ("long achievement", lambda d: d["achievements"].append("An achievement that goes on for a long time " * 12)),
+    ("symbols", lambda d: d["experience"][0]["bullets"].append("Cut costs by ≈30% → faster “checkout” — résumé café ✓")),
+    ("new summary", lambda d: d.update(summary="Mobile engineer who ships React Native apps with real-time features.")),
+    ("extra bullets", lambda d: [e["bullets"].extend(["An extra supporting line of experience text that wraps fully"] * 3) for e in d["experience"]]),
+])
+def test_ordinary_edits_to_the_real_resume_still_give_a_valid_pdf_in_the_users_own_design(name, change):
+    from app.services.resume_pdf_renderers.render_validator import validate_rendering
+    original = (FIXTURES / "Vidip_Resume.pdf").read_bytes()
+    out, _, draft = _edited(original, change)
+    verdict = validate_rendering(original, out, draft)
+    failed = [(c["name"], c["detail"]) for c in verdict["checks"] if c["status"] == "fail"]
+    assert verdict["passed"], (name, failed)

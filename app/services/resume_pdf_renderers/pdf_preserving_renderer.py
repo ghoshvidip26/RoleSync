@@ -39,6 +39,7 @@ from .layout_representation import _rows, build_layout_representation
 MAX_SHRINK = 0.20               # word spaces may compress by this much to fit a line (TeX does the same)
 DEFAULT_MARGIN_BETWEEN = 8.0    # minimum gap between left text and right-aligned text
 MAX_PAGES = 6
+BASELINE_ROOM = 6.0             # pt kept free below the last baseline (descenders, tall glyph boxes)
 MIN_LEADING = 1.12              # never set lines closer than this multiple of the font size
 # (line-spacing scale, font scale), gentlest first; used to fit the original page count
 FIT_STEPS = [(1.0, 1.0), (0.96, 1.0), (0.92, 1.0), (0.92, 0.97), (0.88, 0.95), (0.86, 0.93)]
@@ -741,7 +742,11 @@ class PdfPreservingRenderer(BaseResumeRenderer):
 class _Drawer:
     def __init__(self, o: _Original, fonts: FontBook, doc: pymupdf.Document):
         self.o, self.fonts, self.doc = o, fonts, doc
-        self.bottom = o.page_h - o.margin_top
+        # The usable page ends one top-margin above the bottom edge (the validator's rule too). Baselines stop a
+        # little earlier so descenders and tall glyphs such as "|" stay inside it; an original that itself runs lower
+        # keeps its own extent.
+        lowest = max(o.baseline.values(), default=0.0)
+        self.bottom = max(o.page_h - o.margin_top - BASELINE_ROOM, lowest + 2.0)
         first = min(o.baseline.values()) if o.baseline else o.margin_top + 10
         self.first_baseline = first
         self.page = None

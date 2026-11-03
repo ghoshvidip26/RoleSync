@@ -154,7 +154,7 @@ def test_the_template_prefers_languages_and_tools_over_general_concepts_and_read
     assert "I work mainly with Python, JavaScript and TypeScript." in body and "OOP" not in body
     assert "worked as an Intern at Aforro" in body                                   # article matches the title
     proof = [line for line in body.splitlines() if line.startswith("• ")]
-    assert len(proof) == 1 and proof[0].startswith("• Built end-to-end Rider app workflows in React Native over REST APIs: pickup")
+    assert len(proof) == 1 and proof[0].startswith("• At Aforro: Built end-to-end Rider app workflows in React Native over REST APIs: pickup")
     assert "…" not in proof[0] and not proof[0].endswith((",", ";", "."))        # cut at a clause, no ellipsis
     assert len(proof[0]) <= oa.MAX_PROOF_CHARS + 2
 

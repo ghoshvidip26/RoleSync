@@ -252,3 +252,22 @@ def test_the_real_client_points_at_groq_waits_out_rate_limits_and_never_logs_the
     client = lf._client()                                    # building it makes no network call
     assert str(client.base_url).rstrip("/") == lf.GROQ_BASE_URL and client.max_retries == lf.GROQ_RETRIES == 3
     assert client.api_key == KEY and client.timeout == lf.GROQ_TIMEOUT_SECONDS
+
+
+def test_when_both_models_fail_the_error_says_so_and_why(groq):
+    err = RuntimeError("rate limit reached for model; try again in 20s")
+    err.status_code = 429
+    groq.client = FakeGroq(err, err, err, err)
+    with pytest.raises(RuntimeError) as shown:
+        lf.FallbackChat(local(error=RuntimeError("prediction aborted, token repeat limit reached"))).invoke([("human", "h")], format={"title": "X"})
+    text = str(shown.value)
+    assert "token repeat limit reached" in text and "the Groq fallback failed too" in text and "rate limit reached" in text
+    assert KEY not in text
+
+
+def test_the_structured_path_reports_both_failures_too(groq):
+    primary = MagicMock()
+    primary.with_structured_output.return_value.invoke.side_effect = RuntimeError("model not found")
+    groq.client = FakeGroq("not json")
+    with pytest.raises(RuntimeError, match=r"model not found.*Groq fallback failed too"):
+        lf.FallbackChat(primary).with_structured_output(Answer).invoke([("human", "h")])
