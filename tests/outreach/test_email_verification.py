@@ -36,8 +36,11 @@ def run(body, subject="Performance work and Cyberdyne Systems", profile=PROFILE,
         return OutreachAgent().run(profile, COMPANY, recipient)
 
 
+TEMPLATE_SUBJECT = "Sarah Connor: Backend Engineer interested in Cyberdyne Systems"
+
+
 def used_template(result):
-    return result.subject == "Sarah Connor: interested in opportunities at Cyberdyne Systems"
+    return result.subject == TEMPLATE_SUBJECT
 
 
 def test_a_supported_email_is_used_as_written():
@@ -70,16 +73,19 @@ def test_a_recipient_without_a_name_cannot_be_greeted_by_an_invented_one():
     nameless = Recipient(id="r2", name=None, email="founders@cyberdyne.ai", role=None)
     assert used_template(run(GOOD, recipient=nameless))                            # "Hi Miles" would be made up
     generic = GOOD.replace("Hi Miles", "Hi there")
-    assert not used_template(run(generic, recipient=nameless))
+    result = run(generic, recipient=nameless)
+    assert not used_template(result)
+    assert result.body.startswith("Hi Cyberdyne Systems Team,")                    # a team greeting, never an invented name
 
 
 def test_the_template_is_built_from_the_real_background_and_passes_the_same_checks():
     draft = oa._template_email(PROFILE, COMPANY, RECIPIENT)
     assert draft.body.startswith("Hi Miles,")
     assert "Most recently I've worked as a Backend Engineer at PayLoop." in draft.body
-    assert "I work mainly with Python, Kubernetes, PostgreSQL." in draft.body
+    assert "I work mainly with Python, Kubernetes, PostgreSQL and Redis." in draft.body
     assert "Cyberdyne Systems" in draft.body and draft.body.rstrip().endswith("Sarah Connor")
-    oa._verify_email(draft, PROFILE, COMPANY, RECIPIENT, evidence="")              # raises if the template made a claim
+    written = draft.body.split(oa.CLOSING_REGARDS)[0]                              # everything before the sign-off
+    oa._verify_email(DraftEmail(subject=draft.subject, body=written), PROFILE, COMPANY, RECIPIENT, evidence="")   # raises if it made a claim
 
 
 def test_the_template_picks_the_bullet_closest_to_the_recipient_and_works_for_a_sparse_profile():
@@ -113,7 +119,7 @@ def test_an_email_that_names_only_the_title_and_employer_is_generic_and_replaced
         oa._verify_email(DraftEmail(subject="Introducing Sarah Connor", body=LIVE_GENERIC), PROFILE, COMPANY, RECIPIENT, evidence="")
     result = run(LIVE_GENERIC)
     assert used_template(result)
-    assert "I work mainly with Python, Kubernetes, PostgreSQL." in result.body                  # ...and the template is specific
+    assert "I work mainly with Python, Kubernetes, PostgreSQL and Redis." in result.body                  # ...and the template is specific
 
 
 @pytest.mark.parametrize("phrase", ["Thank you for considering my application.", "I recently applied to the open position.", "I saw the opening on your site."])
@@ -134,7 +140,7 @@ def test_a_domain_the_model_split_with_a_space_is_repaired_and_the_link_is_not_a
 def test_a_profile_with_nothing_to_cite_always_gets_the_template():
     sparse = Profile(id="p2", name="John Doe", email="john@example.com", summary="Backend developer.")
     result = run(GOOD.replace("Sarah Connor", "John Doe"), profile=sparse)
-    assert result.subject == "John Doe: interested in opportunities at Cyberdyne Systems" and "None" not in result.body
+    assert result.subject == "John Doe: interested in Cyberdyne Systems" and "None" not in result.body
 
 
 def test_the_template_prefers_languages_and_tools_over_general_concepts_and_reads_cleanly():
@@ -145,11 +151,12 @@ def test_the_template_prefers_languages_and_tools_over_general_concepts_and_read
                     "replacements, cancellations, cash collection, and order management for the field team across the country."],
     )
     body = oa._template_email(profile, COMPANY, RECIPIENT).body
-    assert "I work mainly with Python, JavaScript, TypeScript." in body and "OOP" not in body
+    assert "I work mainly with Python, JavaScript and TypeScript." in body and "OOP" not in body
     assert "worked as an Intern at Aforro" in body                                   # article matches the title
-    example = next(line for line in body.splitlines() if line.startswith("For example:"))
-    assert example == ("For example: Built end-to-end Rider app workflows in React Native over REST APIs: "
-                       "pickup, delivery, returns, replacements, cancellations, cash collection.")      # a clean cut, no ellipsis
+    proof = [line for line in body.splitlines() if line.startswith("• ")]
+    assert len(proof) == 1 and proof[0].startswith("• Built end-to-end Rider app workflows in React Native over REST APIs: pickup")
+    assert "…" not in proof[0] and not proof[0].endswith((",", ";", "."))        # cut at a clause, no ellipsis
+    assert len(proof[0]) <= oa.MAX_PROOF_CHARS + 2
 
 
 def test_clause_cut_keeps_short_text_and_never_ends_mid_clause():

@@ -71,12 +71,12 @@ def test_the_response_structure_is_preserved():
 def test_the_draft_is_never_empty_for_a_real_resume():
     d = draft()
     assert d["headline"] and d["summary"]
-    for field in ("skills_to_highlight", "experience_edits", "projects_to_highlight", "recommendations", "claims_requiring_confirmation"):
+    for field in ("skills", "experience", "projects", "recommendations", "claims_requiring_confirmation"):
         assert d[field], field
 
 
 def test_highlighted_skills_are_the_candidates_own_and_asked_for_by_the_job():
-    skills = draft()["skills_to_highlight"]
+    skills = draft()["skills"]
     assert skills == ["Python", "PostgreSQL", "Redis", "REST APIs", "Docker"]       # in the job's order
     assert not {"Kafka", "FastAPI", "Kubernetes"} & set(skills)                        # only the job asks for these
 
@@ -87,7 +87,8 @@ def test_what_the_job_wants_but_the_resume_lacks_is_a_claim_to_confirm_never_a_s
     for missing in ("FastAPI", "Kafka", "Kubernetes"):
         assert missing in claims
     assert "Python" not in claims and "Docker" not in claims                           # the candidate has these
-    everything = " ".join([d["headline"], d["summary"], *d["skills_to_highlight"], *d["experience_edits"], *d["projects_to_highlight"]])
+    bullets = [b for role in d["experience"] for b in role["bullets"]] + [b for p in d["projects"] for b in p["bullets"]]
+    everything = " ".join([d["headline"], d["summary"], *d["skills"], *bullets, *[p["name"] for p in d["projects"]]])
     for missing in ("FastAPI", "Kafka", "Kubernetes"):
         assert missing not in everything
 
@@ -95,55 +96,60 @@ def test_what_the_job_wants_but_the_resume_lacks_is_a_claim_to_confirm_never_a_s
 def test_headline_and_summary_use_the_real_title_employer_and_skills():
     d = draft()
     assert d["headline"] == "Junior Mobile Developer | Python, PostgreSQL, Redis"
-    assert d["summary"].startswith("Junior Mobile Developer at Aforro with experience in Python, PostgreSQL, Redis, REST APIs.")
+    assert d["summary"].startswith("Junior Mobile Developer at Aforro. Skilled in Python, PostgreSQL, Redis, REST APIs")
 
 
-def test_experience_edits_quote_real_bullets_unchanged():
-    d = draft()
-    flat = " ".join(" ".join(PROFILE["experience"]).replace("/n", "\n").split())
-    for edit in d["experience_edits"]:
-        quoted = edit.split("“", 1)[1].split("”", 1)[0]
-        assert quoted.rstrip("…").rstrip() in flat                                      # a real bullet, not a paraphrase
-    assert d["experience_edits"][0].startswith("Junior Mobile Developer at Aforro: lead with")
-    assert "returns and cancellations" not in " ".join(d["experience_edits"])           # the wrapped bullet is not the best match here
+def test_every_original_bullet_is_kept_unchanged_with_the_most_relevant_first():
+    role = draft()["experience"][0]
+    assert role["job_title"] == "Junior Mobile Developer" and role["company"] == "Aforro"
+    assert role["duration"] == "Jul 2026 – Present" and role["location"] == "Bengaluru"      # dates and place are kept
+    assert set(role["bullets"]) == {
+        "Built end-to-end Rider app workflows in React Native over REST APIs: pickup, delivery, returns and cancellations.",
+        "Integrated rider payments and COD collection, supporting backend APIs.",
+    }                                                                                         # nothing dropped or reworded
+    assert role["bullets"][0] == "Integrated rider payments and COD collection, supporting backend APIs."   # best match for the job
 
 
 def test_wrapped_bullets_are_rejoined_before_matching():
     profile = {"skills": ["Python"], "experience": ["Dev | Acme\n• Built payment services in Python that handle\nhigh volume traffic with retries."]}
-    edit = draft(profile=profile, jd="Python payment services.")["experience_edits"][0]
-    assert "handle high volume traffic with retries." in edit
+    bullets = draft(profile=profile, jd="Python payment services.")["experience"][0]["bullets"]
+    assert bullets == ["Built payment services in Python that handle high volume traffic with retries."]
 
 
-def test_only_named_real_projects_are_suggested():
-    projects = draft()["projects_to_highlight"]
-    assert len(projects) == 1 and projects[0].startswith("StackSearch (Python, FAISS, PostgreSQL): matches the job on")
+def test_only_named_real_projects_are_kept_and_never_given_an_invented_name():
+    projects = draft()["projects"]
+    assert [p["name"] for p in projects] == ["StackSearch"]
+    assert projects[0]["technologies"] == ["Python", "FAISS", "PostgreSQL"]
 
 
 def test_a_job_title_noun_is_not_counted_as_a_skill_match():
-    profile = {"skills": ["Python"], "projects": ["SearchTool | GitHub | Go\n• Built a search engine in Go."]}
-    assert draft(profile=profile, jd="Backend Engineer. Python.")["projects_to_highlight"] == []     # "engine" is not "Engineer"
+    profile = {"skills": ["Python"], "projects": ["SearchTool | GitHub | Go\n• Built a search engine.",
+                                                   "PyTool | GitHub | Python\n• Built tools in Python."]}
+    names = [p["name"] for p in draft(profile=profile, jd="Backend Engineer. Python.")["projects"]]
+    assert names == ["PyTool", "SearchTool"]          # "engine" is not "Engineer", so only PyTool matches the job
 
 
 def test_a_resume_with_no_overlap_gets_an_honest_explanation_not_an_empty_draft():
     profile = {"skills": ["Cooking, Baking"], "experience": ["Chef | Bistro, Paris\n• Ran the pastry section."]}
     d = draft(profile=profile, jd="Backend Engineer. Python, Kafka, PostgreSQL.")
-    assert d["skills_to_highlight"] == [] and d["projects_to_highlight"] == [] and d["experience_edits"] == []
-    assert d["headline"] == "Chef"
+    assert d["headline"] == "Chef" and d["experience"][0]["job_title"] == "Chef"
+    assert d["skills"] == ["Cooking", "Baking"]                       # nothing matched, so the resume's own skills are kept
     assert any("little overlap" in r for r in d["recommendations"])
+    assert not any("moved to the top" in r for r in d["recommendations"])      # no false claim of relevance
     assert "Kafka" in " ".join(d["claims_requiring_confirmation"])
 
 
 def test_a_profile_without_structured_entries_still_works():
     d = draft(profile={"summary": "Backend engineer with Python experience.", "skills": ["Python, Kafka"]}, jd="Python and Kafka.")
-    assert d["skills_to_highlight"] == ["Python", "Kafka"] and d["headline"] == "Python, Kafka"
-    assert d["summary"] == "Backend engineer with Python experience."
+    assert d["skills"] == ["Python", "Kafka"] and d["headline"] == "Python, Kafka"
+    assert "Python" in d["summary"] and "Kafka" in d["summary"]
+    assert d["experience"] == [] and d["projects"] == []
 
 
-def test_lists_are_capped_and_free_of_duplicates():
+def test_skills_have_no_duplicates_even_across_case_and_comma_joined_lists():
     profile = {"skills": [", ".join(f"Tool{i}" for i in range(30)) + ", Python, python"], "projects": []}
     d = draft(profile=profile, jd="Python " + " ".join(f"Tool{i}" for i in range(30)))
-    assert len(d["skills_to_highlight"]) <= rt.MAX_ITEMS
-    assert len({s.lower() for s in d["skills_to_highlight"]}) == len(d["skills_to_highlight"])
+    assert len({s.lower() for s in d["skills"]}) == len(d["skills"]) and d["skills"].count("Python") == 1
 
 
 def test_input_checks_and_retrieval_errors_are_unchanged():

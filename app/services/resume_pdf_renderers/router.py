@@ -45,3 +45,37 @@ def get_renderer(layout_metadata: dict[str, Any]) -> BaseResumeRenderer:
     raise ValueError(
         "This resume layout is not supported for automatic rendering."
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# Choosing how a tailored resume is drawn: the user's own design, or a template from the gallery.
+
+class TemplateChoiceRequired(ValueError):
+    """The user must pick a template (their own design is unavailable or cannot be reproduced)."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+ORIGINAL = "original"
+
+
+def select_renderer(template: str | None, original_pdf: bytes | None) -> tuple[BaseResumeRenderer, str]:
+    """(renderer, name) for the requested template.
+
+    ``template`` is a gallery template id, ``"original"`` (rebuild the uploaded design), or None, which
+    means "the uploaded design if there is one". Raises TemplateChoiceRequired when the user has to pick,
+    and ValueError for an unknown template id.
+    """
+    from app.services.resume_pdf_renderers.pdf_preserving_renderer import PdfPreservingRenderer
+    from app.services.resume_pdf_renderers.template_renderer import TemplateRenderer
+
+    name = (template or "").strip().lower()
+    if name in {"", ORIGINAL}:
+        if not original_pdf:
+            raise TemplateChoiceRequired(
+                "No original resume PDF is stored for this profile, so its own design cannot be used. "
+                "Please select a resume template.")
+        return PdfPreservingRenderer(original_pdf), ORIGINAL
+    return TemplateRenderer(name), f"template:{name}"

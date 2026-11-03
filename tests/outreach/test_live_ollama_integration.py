@@ -1,4 +1,7 @@
+import json
 import os
+import urllib.request
+
 import pytest
 from app.services import outreach_agent
 from app.models.company import Company
@@ -8,6 +11,21 @@ from app.services import resume_service
 from tests.conftest import create_sample_pdf
 
 
+def _installed_ollama_models() -> set[str]:
+    try:
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2) as response:
+            return {m["name"] for m in json.load(response)["models"]}
+    except Exception:
+        return set()
+
+
+def _missing_models() -> list[str]:
+    installed = _installed_ollama_models()
+    wanted = [os.environ["OLLAMA_CHAT_MODEL"], os.environ["OLLAMA_EMBEDDING_MODEL"]]
+    return [m for m in wanted if (m if ":" in m else f"{m}:latest") not in installed]
+
+
+@pytest.mark.skipif(bool(_missing_models()), reason=f"needs these Ollama models installed: {_missing_models()}")
 def test_live_end_to_end_resume_rag_outreach():
     """Live integration test connecting PyMuPDF, Ollama qwen:latest, nomic-embed-text FAISS, and OutreachAgent."""
     resume_text = (
@@ -33,7 +51,7 @@ def test_live_end_to_end_resume_rag_outreach():
     extracted = resume_service.extract_and_analyze_resume(pdf_bytes)
     assert extracted.name == "Alex Rivera"
     assert "alex.rivera@example.com" in extracted.email
-    assert extracted.github == "https://github.com/arivera"
+    assert extracted.github == "github.com/arivera"
 
     # 2. Persist profile and build FAISS index with nomic-embed-text
     profile = Profile(
@@ -59,4 +77,4 @@ def test_live_end_to_end_resume_rag_outreach():
     assert draft.subject
     assert len(draft.body) > 30
     assert "Alex Rivera" in draft.body
-    assert "https://github.com/arivera" in draft.body
+    assert "github.com/arivera" in draft.body

@@ -103,8 +103,18 @@ def extract_skills(skills_text: str) -> dict[str, list[str]]:
 
     matches = list(category_pattern.finditer(skills_text))
 
+    if not matches:
+        # No category labels ("Languages: ..."): the section is one plain list of skills.
+        items = [
+            re.sub(r"^[•●▪*-]\s*", "", item).strip()
+            for item in re.split(r"[,;|\n]", skills_text)
+        ]
+        result["skills"] = list(dict.fromkeys(item for item in items if item))
+        return result
+
     for index, match in enumerate(matches):
-        category = re.sub(r"\s+", " ", match.group(1)).casefold()
+        # "AI/ML", "AI / ML" and "AI /ML" are one label; so are "Frontend&Mobile" and "Frontend & Mobile".
+        category = re.sub(r"\s*([&/])\s*", r" \1 ", re.sub(r"\s+", " ", match.group(1))).strip().casefold()
 
         start = match.end()
         end = (
@@ -120,7 +130,7 @@ def extract_skills(skills_text: str) -> dict[str, list[str]]:
             if item.strip()
         ]
 
-        field = category_to_field[category]
+        field = category_to_field.get(category, "skills")      # a label we do not know still keeps its skills
 
         if field == "skills":
             result["skills"].extend(items)
@@ -157,7 +167,60 @@ def splitEntries(section_text: str,starts_entry) -> list[str]:
     
     return ["\n".join(entry) for entry in entries if entry]
 
-def extract_experience(section_text: str) -> list[str]: 
+_MONTH = r"(?:[A-Za-z]{3,9}\.?\s+)?"
+_DATE_ONLY = re.compile(rf"^{_MONTH}\d{{4}}\s*[–—-]\s*(?:{_MONTH}\d{{4}}|present|current|now)$", re.IGNORECASE)
+_BULLET_START = re.compile(r"^(?:[•●▪◦·∙]\s*|[-*]\s+)")
+
+
+def _is_header_line(line: str) -> bool:
+    """A short line that can be a company, location or job title (not a bullet, not a sentence)."""
+    return (not _BULLET_START.match(line)) and len(line) <= 70 and not line.endswith((".", ",", ";", ":"))
+
+
+def _extract_experience_by_dates(section_text: str) -> list[str]:
+    """Experience laid out as company / location / job title / dates (no "|" in the headings): each date
+    line closes a heading block of up to three lines above it, and the bullets that follow belong to it.
+    Returned in the form the rest of the app reads: "Title | Company, Location", dates, then bullets.
+    A role under the same company as the one before it (title and dates only) inherits that company."""
+    lines = [l.strip() for l in section_text.splitlines() if l.strip()]
+    date_at = [i for i, l in enumerate(lines) if _DATE_ONLY.match(l)]
+    if not date_at:
+        return []
+
+    headers: list[tuple[int, int, list[str], str]] = []      # (first line, date line, heading lines, dates)
+    for n, d in enumerate(date_at):
+        floor = date_at[n - 1] + 1 if n else 0
+        start = d
+        while start > floor and d - start < 3 and _is_header_line(lines[start - 1]):
+            start -= 1
+        headers.append((start, d, lines[start:d], lines[d]))
+    if headers[0][0] != 0 and not all(_is_header_line(l) for l in lines[: headers[0][0]]):
+        return []                                                # text before the first heading: not this layout
+
+    entries: list[str] = []
+    company = location = ""
+    for n, (start, d, head, dates) in enumerate(headers):
+        if len(head) >= 2:
+            company, location = head[0], (head[1] if len(head) >= 3 else "")
+            title = head[-1]
+        elif head:
+            title = head[0]
+        else:
+            continue
+        end = headers[n + 1][0] if n + 1 < len(headers) else len(lines)
+        bullets: list[list[str]] = []
+        for line in lines[d + 1:end]:
+            if _BULLET_START.match(line) or not bullets:
+                bullets.append([_BULLET_START.sub("", line)])
+            else:
+                bullets[-1].append(line)                         # a bullet that wrapped onto the next line
+        where = ", ".join(x for x in (company, location) if x)
+        header = f"{title} | {where}" if where else title
+        entries.append("\n".join([header, dates, *(f"• {' '.join(b)}" for b in bullets)]))
+    return entries
+
+
+def extract_experience(section_text: str) -> list[str]:
     def is_job_heading(line: str) -> bool:
         return (
             "|" in line
@@ -165,6 +228,10 @@ def extract_experience(section_text: str) -> list[str]:
             and not line.startswith(("•", "-", "*"))
         )
 
+    if not any(is_job_heading(l.strip()) for l in section_text.splitlines()):
+        by_dates = _extract_experience_by_dates(section_text)
+        if by_dates:
+            return by_dates
     return splitEntries(section_text, is_job_heading)
 
 def extract_projecs(section_text: str) -> list[str]:
@@ -178,17 +245,27 @@ def extract_projecs(section_text: str) -> list[str]:
     return splitEntries(section_text, is_project_heading)
 
 def extract_bullet_entries(section_text: str)->list[str]:
-    entries = []
+    """One entry per bullet. A bullet marker starts a new entry; a line without one continues the
+    previous entry (a bullet that wrapped onto the next line). The first line starts an entry even
+    without a marker. Only whitespace is normalised: wording, punctuation, numbers and dates are kept.
+
+    "•", "●" and "▪" are markers with or without a following space. "-" and "*" must be followed by a
+    space (or end the line), so a wrapped line that starts with "-5%" or "*args" is not mistaken for a
+    new bullet."""
+    entries: list[list[str]] = []
     for line in section_text.splitlines():
         line = line.strip()
-        if not line: 
+        if not line:
             continue
 
-        line = re.sub(r"^[•●▪*-]\s*", "", line).strip()
-        if line:
-            entries.append(line)
-    
-    return entries
+        marker = re.match(r"(?:[•●▪]\s*|[-*](?:\s+|$))", line)
+        if marker or not entries:
+            entries.append([line[marker.end():] if marker else line])
+        else:
+            entries[-1].append(line)
+
+    joined = (" ".join(" ".join(parts).split()) for parts in entries)
+    return [entry for entry in joined if entry]
 
 def extractEducation(section_text: str) -> list[str]:
     def is_education_heading(line: str)-> bool:

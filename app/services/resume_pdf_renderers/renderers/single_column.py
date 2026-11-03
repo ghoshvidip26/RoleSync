@@ -23,6 +23,18 @@ DEFAULTS = {
 }
 
 
+_FONT_CACHE: dict[str, pymupdf.Font] = {}
+
+
+def _draw_text(page, point, text, *, fontname, fontsize, color):
+    """Draw with a Font object: insert_text turns en/em dashes, curly quotes and
+    apostrophes (anything outside Latin-1) into a middle dot."""
+    font = _FONT_CACHE.setdefault(fontname, pymupdf.Font(fontname))
+    writer = pymupdf.TextWriter(page.rect)
+    writer.append(point, text, font=font, fontsize=fontsize)
+    writer.write_text(page, color=color)
+
+
 def _clean(value: Any) -> str:
     if value is None:
         return ""
@@ -212,7 +224,7 @@ class _SingleColumnWriter:
             else:
                 position_x = x
 
-            self.page.insert_text(
+            _draw_text(self.page, 
                 (position_x, self.y + size),
                 line,
                 fontname=font,
@@ -253,7 +265,7 @@ class _SingleColumnWriter:
                     fill=color,
                 )
 
-            self.page.insert_text(
+            _draw_text(self.page, 
                 (self.left + indent, self.y + size),
                 line,
                 fontname=font,
@@ -264,6 +276,93 @@ class _SingleColumnWriter:
 
         self.y += 2
 
+    def write_split_line(
+        self,
+        left_text: str,
+        right_text: str = "",
+        *,
+        size: float | None = None,
+        font: str | None = None,
+        color: tuple | None = None,
+        gap: float = 1,
+    ):
+        left_text = _clean(left_text)
+        right_text = _clean(right_text)
+
+        if not left_text and not right_text:
+            return
+
+        size = size or self.styles["body_size"]
+        font = font or self.styles["body_font"]
+        color = color or self.styles["body_color"]
+
+        leading = size * 1.3
+        column_gap = 8.0
+
+        right_width = (
+            pymupdf.get_text_length(
+                right_text,
+                fontname=font,
+                fontsize=size,
+            )
+            if right_text else 0
+        )
+
+        if right_width >= self.content_width:
+            if left_text:
+                self.write_text(
+                    left_text,
+                    size=size,
+                    font=font,
+                    color=color,
+                    gap=0,
+                )
+            self.write_text(
+                right_text,
+                size=size,
+                font=font,
+                color=color,
+                align=2,
+                gap=gap,
+            )
+            return
+
+        left_width = (
+            self.content_width - right_width - column_gap
+            if right_text else self.content_width
+        )
+
+        lines = self._wrap(left_text, font, size, left_width)
+
+        if not lines:
+            lines = [""]
+
+        self.ensure_space(leading * len(lines) + gap)
+
+        for index, line in enumerate(lines):
+            _draw_text(self.page, 
+                (self.left, self.y + size),
+                line,
+                fontname=font,
+                fontsize=size,
+                color=color,
+            )
+
+            if index == 0 and right_text:
+                _draw_text(self.page, 
+                    (
+                        self.right - right_width,
+                        self.y + size,
+                    ),
+                    right_text,
+                    fontname=font,
+                    fontsize=size,
+                    color=color,
+                )
+
+            self.y += leading
+
+        self.y += gap
     def write_section(self, title: str):
         self.ensure_space(28)
 
@@ -420,6 +519,10 @@ class SingleColumnRenderer(BaseResumeRenderer):
                 gap=4,
             )
 
+        if draft.get("summary"):
+            writer.write_section("Summary")
+            writer.write_text(draft["summary"], gap=2)
+
         # Professional experience.
         experience = _as_list(draft.get("experience"))
 
@@ -428,29 +531,29 @@ class SingleColumnRenderer(BaseResumeRenderer):
 
             for item in experience:
                 if isinstance(item, dict):
-                    heading = self._entry_label(
-                        item, ("company", "job_title")
-                    )
+                    company = _clean(item.get("company"))
+                    job_title = _clean(item.get("job_title"))
                     location = _clean(item.get("location"))
                     duration = _clean(item.get("duration"))
 
-                    if heading:
-                        writer.write_text(
-                            heading,
-                            font=styles["heading_font"],
-                            size=styles["body_size"],
-                            gap=1,
-                        )
-
-                    details = " | ".join(
-                        value for value in (location, duration) if value
+                    writer.write_split_line(
+                        company,
+                        location,
+                        size=styles["body_size"],
+                        font=styles["heading_font"],
+                        color=styles["body_color"],
+                        gap=1,
                     )
-                    if details:
-                        writer.write_text(
-                            details,
-                            size=max(7.5, styles["body_size"] - 0.5),
-                            gap=2,
-                        )
+
+                    # Job title on the left, duration on the right.
+                    writer.write_split_line(
+                        job_title,
+                        duration,
+                        size=styles["body_size"],
+                        font="heit",
+                        color=styles["body_color"],
+                        gap=2,
+                    )
 
                     for bullet in _as_list(item.get("bullets")):
                         writer.write_bullet(_clean(bullet))

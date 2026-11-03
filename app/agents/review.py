@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.services.outreach_agent import experience_metadata, get_retriever, parse_entry, project_metadata
+from app.services.outreach_agent import CHAT_MODEL, experience_metadata, get_retriever, parse_entry, project_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ class ResumeDraft(BaseModel):
 # temperature=0 (greedy decoding) makes this model fall into repetition loops that Ollama
 # aborts, so use light sampling plus a repeat penalty. The output schema is passed per call.
 review_agent = ChatOllama(
-    model="qwen:latest",
+    model=CHAT_MODEL,           # OLLAMA_CHAT_MODEL switches it, same as the tailoring and email code
     temperature=0.3,
     repeat_penalty=1.15,
     num_ctx=8192,
@@ -167,6 +167,7 @@ include such etc eg ie other related least minimum role position candidate ideal
 responsible responsibilities responsibility hands handson track record tools tool technologies
 technology systems system software applications application products product solutions
 senior junior lead ensure support across within also well new
+apply now description job jobs about looking closely own ll ve re colleague colleagues play
 """.split())
 
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+#_-]*")
@@ -390,7 +391,8 @@ class _Unit:
 
     @property
     def priority(self) -> int:  # work and project evidence outranks everything else
-        return {"work": 0, "project": 0, "tech": 0, "other": 1, "skill": 2}[self.kind]
+        # A summary line usually just restates skills, so it ranks below an actual skills entry.
+        return {"work": 0, "project": 0, "tech": 0, "other": 1, "skill": 2, "summary": 3}[self.kind]
 
 
 class _Best:
@@ -431,6 +433,13 @@ class _Candidate:
         self._add_profile_units(profile)
         for item in evidence:  # retrieved chunks can hold text the structured fields lost
             meta = item["metadata"]
+            if meta.get("source_section") == "skills":
+                # A skills line is a list of separate skills, not one phrase: split it like the saved skills fields.
+                for line in item["content"].splitlines():
+                    for part in re.split(r"[,;|]", line.split(":")[-1]):
+                        if part.strip():
+                            self.units.append(_Unit(part.strip(), "skill"))
+                continue
             label = _label_from_metadata(meta)
             kind = {"experience": "work", "projects": "project"}.get(meta.get("source_section"), "other")
             if meta.get("project_name") and meta["project_name"] not in self.project_names:
@@ -468,7 +477,7 @@ class _Candidate:
             self._add_lines("\n".join(entry.lines) or entry.header, "project", label)
         for field, label in (("summary", "summary"), ("achievements", "achievements"), ("education", "education")):
             for text in _as_text_list(profile.get(field)):
-                self._add_lines(text, "other", label)
+                self._add_lines(text, "summary" if field == "summary" else "other", label)
         for field in ("skills", "programming_languages", "frameworks", "databases_tools"):
             for text in _as_text_list(profile.get(field)):
                 for item in re.split(r"[,;|]", text.split(":")[-1]):
@@ -488,11 +497,13 @@ class _Candidate:
                     return True
         return False
 
-    def best_unit(self, terms: list[str]) -> _Best:
+    def best_unit(self, terms: list[str], kinds: tuple[str, ...] | None = None) -> _Best:
         """The line/item showing the most of `terms` together. Ties go to work experience and
-        projects, then other text, and only last to the skills list."""
+        projects, then other text, and only last to the skills list. `kinds` limits the search."""
         best, best_hits, work_hit = None, [], False
         for u in self.units:
+            if kinds is not None and u.kind not in kinds:
+                continue
             hits = [t for t in terms if t in u.tokens]
             if hits and u.kind in ("work", "project", "tech"):
                 work_hit = True
@@ -523,16 +534,49 @@ def _classify(req: str, a: RequirementAssessment | None, cand: _Candidate) -> tu
     label = lambda ts: ", ".join(words.get(t, t) for t in ts)   # show words, not stems
     anywhere = [t for t in terms if t in cand.tokens]
     best = cand.best_unit(terms)          # terms found together in one line/item
-    present, source = best.present, best.source
+    present = best.present
     has_number = bool(re.search(r"\d", req))  # years / quantities cannot be verified lexically
 
-    def cite(shown: str) -> str:
+    # Show work or project evidence when it covers most of the requirement, even if a skills-list
+    # line happens to contain a few more of its words.
+    evidence = best
+    if best.unit is not None and best.unit.kind in ("skill", "other", "summary"):
+        work = cand.best_unit(terms, kinds=("work", "project", "tech"))
+        if work.unit is not None and len(work.present) >= max(1, -(-len(terms) * 6 // 10)):
+            evidence = work
+    source = evidence.source
+
+    def cite(shown: str, shown_best: _Best | None = None) -> str:
         """Say where the evidence is from; flag evidence that is only a skills-list entry."""
-        if best.unit is None or shown != best.excerpt:
+        b = shown_best or evidence
+        if b.unit is None or shown != b.excerpt:
             return shown
-        if best.unit.kind == "skill":
-            return shown if best.has_work_evidence else f"{shown} (skills list only; no work or project evidence found)"
-        return f"{best.unit.label}: {shown}" if best.unit.label else shown
+        if b.unit.kind == "skill":
+            return shown if b.has_work_evidence else f"{shown} (skills list only; no work or project evidence found)"
+        return f"{b.unit.label}: {shown}" if b.unit.label else shown
+
+    # "JavaScript and React Native": a list of separate skills. Each item is judged on its own and all must
+    # be present (a phrase such as "data pipelines" has no "and", so it still needs its words together).
+    items = [i for i in re.split(r",|;|\band\b|&", req, flags=re.I) if _terms(i)]
+    if len(items) >= 2 and not has_number and not re.search(r"\bor\b", req, re.I):
+        found_items = [(item, cand.best_unit(_terms(item))) for item in items]
+        if all(f.unit is not None and len(f.present) == len(_terms(item)) for item, f in found_items):
+            shown = list(dict.fromkeys(cite(f.excerpt, f) for _, f in found_items))
+            lead = min((f for _, f in found_items), key=lambda f: f.unit.priority)
+            return "matching", f"{req} — {'; '.join(shown)}", lead.source
+
+    # "Expo, Firebase, or native modules": any one of the options is enough.
+    if re.search(r"\bor\b", req, re.I) and not has_number:
+        options = [o for o in re.split(r",|;|\bor\b", req, flags=re.I) if _terms(o)]
+        met = []
+        for option in options:
+            option_terms = _terms(option)
+            found = cand.best_unit(option_terms)
+            if found.unit is not None and len(found.present) == len(option_terms):
+                met.append((found.unit.priority, found))
+        if len(options) >= 2 and met:
+            _, found = min(met, key=lambda m: m[0])
+            return "matching", f"{req} — {cite(found.excerpt, found)} (any one of the options is enough)", found.source
 
     if not terms:
         if status == "matching" and quote_ok:
@@ -541,7 +585,7 @@ def _classify(req: str, a: RequirementAssessment | None, cand: _Candidate) -> tu
 
     coverage = len(present) / len(terms)
     if coverage > 0.5:
-        shown = best.excerpt or (a.evidence_quote.strip() if quote_ok else label(present))
+        shown = evidence.excerpt or (a.evidence_quote.strip() if quote_ok else label(present))
         if status == "matching" and (quote_ok or not has_number):
             return "matching", f"{req} — {cite(shown)}", source
         if status != "matching" and coverage == 1 and not has_number:

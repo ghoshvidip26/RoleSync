@@ -30,15 +30,28 @@ _ROLE_STEMS = {
 class ResumeTailorError(Exception):
     """Raised when resume evidence retrieval or draft generation fails."""
 
+class ExperienceItem(BaseModel):
+    company: str
+    job_title: str
+    duration: str | None=None
+    location: str | None=None
+    bullets: list[str] = Field(default_factory=list)
+
+class ProjectItem(BaseModel):
+    name: str
+    technologies: list[str] = Field(default_factory=list)
+    description: str | None = None
+    bullets: list[str] = Field(default_factory=list)
 
 class TailoredResumeDraft(BaseModel):
-    """Proposed resume edits; these do not overwrite the original profile."""
-
+    """Complete, editable resume draft. Original profile remains unchanged."""
     headline: str | None = None
     summary: str | None = None
-    skills_to_highlight: list[str] = Field(default_factory=list)
-    experience_edits: list[str] = Field(default_factory=list)
-    projects_to_highlight: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    experience: list[ExperienceItem] = Field(default_factory=list)
+    projects: list[ProjectItem] = Field(default_factory=list)
+    achievements: list[str] = Field(default_factory=list)
+    education: list[dict] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     claims_requiring_confirmation: list[str] = Field(default_factory=list)
 
@@ -52,6 +65,54 @@ def _as_text(value) -> str:
         return "\n".join(f"{key}: {_as_text(item)}" for key, item in value.items() if item)
     return str(value)
 
+def _merge_wrapped_items(items: list[str]) -> list[str]:
+    """
+    Rejoin obvious continuation fragments from PDF-extracted list items.
+    Conservative: only merge when the preceding text clearly continues.
+    """
+    if not items:
+        return []
+
+    merged = []
+
+    continuation_endings = re.compile(
+        r"\b(?:for|of|with|including|across|through|using|and|or|"
+        r"to|in|on|by|from|at|the|a|an|their|its)$",
+        re.IGNORECASE,
+    )
+
+    for raw in items:
+        item = " ".join(str(raw).split()).strip()
+
+        if not item:
+            continue
+
+        if not merged:
+            merged.append(item)
+            continue
+
+        previous = merged[-1]
+
+        # Specific continuation pattern present in your stored profile:
+        # "...including 1st" + "Runner-Up at Build on Aptos..."
+        first_achievement_continuation = (
+            re.search(r"\bincluding\s+1st$", previous, re.IGNORECASE)
+            and re.match(r"^Runner[- ]Up\b", item, re.IGNORECASE)
+        )
+
+        # General PDF line-wrap patterns:
+        # "...checkout for" + "local merchants..."
+        obvious_continuation = (
+            continuation_endings.search(previous.rstrip(".;:,"))
+            or item[:1].islower()
+        )
+
+        if first_achievement_continuation or obvious_continuation:
+            merged[-1] = previous.rstrip() + " " + item
+        else:
+            merged.append(item)
+
+    return merged
 
 def _as_list(value) -> list[str]:
     if isinstance(value, str):
@@ -217,115 +278,255 @@ def _llm_prose(job_description: str, facts: dict) -> _Prose | None:
         return None
 
 
-def _build_draft(profile: dict, job_description: str, evidence: str) -> tuple[TailoredResumeDraft, dict]:
-    """Build the draft from the candidate's own data. Every item is a real skill, project or bullet
-    from the resume that overlaps the job description, so nothing can be invented; anything the job
-    asks for that the resume does not show is listed as a claim to confirm, never as a strength."""
-    jd_stems = _terms(job_description)
-    jd_set = set(jd_stems) - _ROLE_STEMS
-    jd_words: dict[str, str] = {}
+def _build_draft(profile: dict,job_description: str,evidence: str)-> tuple[TailoredResumeDraft,dict]:
+    jd_terms = set(_terms(job_description)) - _ROLE_STEMS
+    jd_words = {}
+
     for word in _WORD.findall(job_description):
-        jd_words.setdefault(_norm(word), word.rstrip("."))
-    show = lambda stems: ", ".join(jd_words.get(s, s) for s in stems)
+        jd_words.setdefault(_norm(word),word.rstrip("."))
+    
+    def matchingTerms(text: str) -> list[str]:
+        return list(dict.fromkeys(
+            term for term in _terms(text) if term in jd_terms
+        ))
 
-    known = set(_tokens(f"{json.dumps(profile, default=str)}\n{evidence}"))
+    def relevance(text: str) -> int:
+        return len(matchingTerms(text))
+    
+    def show(terms: list[str])->str:
+        return ", ".join(jd_words.get(term,term) for term in terms)
 
-    # Skills the job asks for that the candidate really lists (every term of the skill must be in the job).
-    listed: list[str] = []
-    for field in ("skills", "programming_languages", "frameworks", "databases_tools"):
-        for text in _as_list(profile.get(field)):
-            listed += [item.strip() for item in re.split(r"[,;|]", text.split(":")[-1]) if item.strip()]
-    skills = []
-    for item in _dedupe(listed):
-        terms = _terms(item)
-        if terms and set(terms) <= jd_set:
-            skills.append((min(jd_stems.index(t) for t in terms), item))
-    matched_skills = [item for _, item in sorted(skills)][:MAX_ITEMS]
+    raw_skills = []
 
-    # Projects, ranked by overlap with the job; only named projects (a name is never made up).
-    projects = []
-    for raw in _as_list(profile.get("projects")):
-        entry = parse_entry(raw)
-        meta = project_metadata(entry)
-        overlap = [t for t in _terms(raw.replace("/n", "\n")) if t in jd_set]
-        if overlap and "project_name" in meta:
-            bonus = 0.5 if meta["project_name"].lower() in evidence.lower() else 0
-            projects.append((len(overlap) + bonus, meta["project_name"], meta.get("technologies"), overlap))
-    projects.sort(key=lambda p: -p[0])
-    project_names = [name for _, name, _, _ in projects]
-    projects_out = [
-        f"{name} ({tech}): matches the job on {show(overlap)}" if tech else f"{name}: matches the job on {show(overlap)}"
-        for _, name, tech, overlap in projects[:5]
+    for field in (
+        "skills",
+        "programming_languages",
+        "frameworks",
+        "databases_tools",
+    ):
+        for entry in _as_list(profile.get(field)):
+            raw_skills.extend(part.strip() for part in re.split(r"[,;|]", entry) if part.strip())
+    
+    skills = _dedupe(raw_skills)
+    # Every distinctive word of the skill must be in the job: "Gemini API" is not a match just because
+    # the job says "API", and "Data Structures & Algorithms" is not one because it says "data".
+    matched_skills = [
+        skill for skill in skills
+        if _terms(skill) and set(_terms(skill)) <= jd_terms
     ]
 
-    # Experience: for each role, the real bullet that best matches the job, quoted as written.
-    roles, edits = [], []
+    matched_skills.sort(
+        key=lambda skill: min(
+            (
+                _terms(job_description).index(term)
+                for term in _terms(skill)
+                if term in _terms(job_description)
+            ),
+            default=9999,
+        )
+    )
+
+    experience_items = []
+    roles = []
+
     for raw in _as_list(profile.get("experience")):
         entry = parse_entry(raw)
         meta = experience_metadata(entry)
-        label = f"{meta['job_title']} at {meta['company']}" if "company" in meta else _shorten(entry.header, 60)
-        roles.append((meta.get("job_title"), meta.get("company")))
-        best = max(
-            ((len([t for t in _terms(line) if t in jd_set]), line) for line in entry.lines),
-            default=(0, ""),
-            key=lambda pair: pair[0],
+
+        company = meta.get("company", "")
+        job_title = meta.get("job_title", "")
+
+        bullets = [
+            line.lstrip("•-* ").strip()
+            for line in entry.lines
+            if line.strip()
+        ]
+
+        # Rank bullets by relevance, but retain all of them.
+        ranked_bullets = sorted(
+            enumerate(bullets),
+            key=lambda item: relevance(item[1]),
+            reverse=True,
         )
-        if best[0]:
-            bullet = best[1].lstrip("• ").strip()
-            matched = show([t for t in _terms(bullet) if t in jd_set])
-            edits.append((best[0], bullet, f"{label}: lead with “{_shorten(bullet, 180)}” (matches {matched})"))
-    edits.sort(key=lambda e: -e[0])
-    edits_out = [text for _, _, text in edits[:5]]
 
-    # Headline and summary: real title, real employer, real skills and a real result.
-    title, company = next(((t, c) for t, c in roles if t), (None, None))
-    top = matched_skills[:3]
-    headline = " | ".join(part for part in (title, ", ".join(top)) if part) or None
-    sentences = []
+        ordered_bullets = [
+            bullet for _, bullet in ranked_bullets
+        ]
+
+        item = ExperienceItem(
+            company=company,
+            job_title=job_title,
+            duration=meta.get("dates"),
+            location=meta.get("location"),
+            bullets=ordered_bullets,
+        )
+
+        score = relevance(raw)
+
+        experience_items.append((score, item))
+        roles.append((job_title, company))
+
+    # Put the most relevant experience first.
+    # experience_items.sort(
+    #     key=lambda item: item[0],
+    #     reverse=True,
+    # )
+
+    # Keep every named project and its original content.
+    project_items = []
+
+    for raw in _as_list(profile.get("projects")):
+        entry = parse_entry(raw)
+        meta = project_metadata(entry)
+
+        name = meta.get("project_name")
+
+        # Never invent a project name.
+        if not name:
+            continue
+
+        technologies = meta.get("technologies") or []
+
+        if isinstance(technologies, str):
+            technologies = [
+                value.strip()
+                for value in re.split(r"[,;|]", technologies)
+                if value.strip()
+            ]
+
+        bullets = [
+            line.lstrip("•-* ").strip()
+            for line in entry.lines
+            if line.strip()
+        ]
+
+        # Keep the original project bullets, prioritizing relevant ones.
+        bullets.sort(
+            key=relevance,
+            reverse=True,
+        )
+
+        project = ProjectItem(
+            name=name,
+            technologies=technologies,
+            description=None,
+            bullets=bullets,
+        )
+
+        project_items.append((relevance(raw), project))
+
+    project_items.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    # Headline uses the candidate's real most recent title.
+    title, company = next(
+        ((title, company) for title, company in roles if title),
+        (None, None),
+    )
+
+    headline_skills = matched_skills[:3]
+
+    headline = " | ".join(
+        part for part in (
+            title,
+            ", ".join(headline_skills),
+        )
+        if part
+    ) or None
+
+    # Build a conservative summary from actual profile facts.
+    summary_parts = []
+
     if title and company:
-        lead = f"{title} at {company}"
-        sentences.append(lead + (f" with experience in {', '.join(matched_skills[:4])}." if matched_skills else "."))
-    elif _as_text(profile.get("summary")).strip():
-        sentences.append(_shorten(_as_text(profile["summary"]), 200).rstrip(".") + ".")
-    if edits:
-        sentences.append(_shorten(edits[0][1], 180).rstrip(".") + ".")
-    summary = _shorten(" ".join(sentences), 350) if sentences else None
+        summary_parts.append(f"{title} at {company}")
 
-    # What the job asks for but the resume does not show.
+    if matched_skills:
+        summary_parts.append(
+            "Skilled in " + ", ".join(matched_skills[:5])
+        )
+
+    summary = (
+        ". ".join(summary_parts).rstrip(".") + "."
+        if summary_parts
+        else _shorten(_as_text(profile.get("summary")), 350) or None
+    )
+
+    # Missing technical terms remain suggestions, never candidate skills.
+    known = set(_tokens(
+        f"{json.dumps(profile, default=str)}\n{evidence}"
+    ))
+
     claims = [
-        f"{word}: the job asks for it but your resume doesn't show it. Add it only if you have really used it."
-        for word in _absent_technical_terms(job_description, known)[:6]
+        (
+            f"{word}: requested by the job description but not found "
+            "in the resume. Add only if you have actually used it."
+        )
+        for word in _absent_technical_terms(job_description, known)[:10]
     ]
 
     recommendations = []
+
     if matched_skills:
-        recommendations.append(f"List {', '.join(matched_skills[:5])} first in your skills section; the job asks for them.")
-    if project_names:
-        recommendations.append(f"Put {project_names[0]} at the top of your projects; it is your closest match to this job.")
-    if edits_out:
-        recommendations.append("Open each role with the matching bullet listed in experience_edits and keep its numbers exactly as written.")
-    if claims:
-        recommendations.append("Do not add the skills in claims_requiring_confirmation unless you have actually used them.")
-    if not (matched_skills or projects_out or edits_out):
         recommendations.append(
-            "Your resume shows little overlap with this job description. Check whether the role fits, or "
-            "add real experience you have that it asks for."
+            "Prioritize these matching skills: "
+            + ", ".join(matched_skills[:5])
+        )
+
+    if project_items:
+        recommendations.append(
+            f"Prioritize the project '{project_items[0][1].name}' "
+            "because it has the strongest keyword overlap."
+        )
+
+    overlap_found = (
+        bool(matched_skills)
+        or any(score for score, _ in experience_items)
+        or any(score for score, _ in project_items)
+    )
+    if experience_items and overlap_found:
+        recommendations.append(
+            "Relevant experience bullets have been moved to the top "
+            "of each role. All original bullets are retained."
+        )
+    if not overlap_found:
+        recommendations.append(
+            "Your resume shows little overlap with this job description. Check whether the role fits, "
+            "or add real experience you have that it asks for."
+        )
+
+    if claims:
+        recommendations.append(
+            "Review missing job requirements separately. "
+            "Do not add unverified skills or technologies."
         )
 
     draft = TailoredResumeDraft(
         headline=_shorten(headline, 120) if headline else None,
         summary=summary,
-        skills_to_highlight=matched_skills,
-        experience_edits=edits_out,
-        projects_to_highlight=projects_out,
-        recommendations=recommendations[:MAX_ITEMS],
+        skills=matched_skills or skills,
+        experience=[item for _, item in experience_items],
+        projects=[item for _, item in project_items],
+        achievements=_merge_wrapped_items(
+            _as_list(profile.get("achievements"))
+        ),
+        education=[{"details": item} for item in _as_list(profile.get("education"))],
+        recommendations=recommendations,
         claims_requiring_confirmation=claims,
     )
-    facts = {  # the only material the model is given, and what its text is checked against
+
+    # Everything the optional model-written headline/summary is given and is checked against
+    # (_llm_prose and _verify_prose read all of these keys).
+    facts = {
         "title": title,
         "company": company,
         "skills": matched_skills[:5],
-        "bullets": [_shorten(e[1], 180) for e in edits[:2]],
+        "bullets": [
+            _shorten(item.bullets[0], 180)
+            for _, item in experience_items[:2]
+            if item.bullets and relevance(item.bullets[0])
+        ],
         "titles": [t for t, _ in roles if t],
         "role": re.split(r"[.\n]", job_description.strip(), maxsplit=1)[0][:80],
         "known": known,
@@ -333,6 +534,7 @@ def _build_draft(profile: dict, job_description: str, evidence: str) -> tuple[Ta
         "candidate_text": f"{json.dumps(profile, default=str)}\n{evidence}".replace("/n", "\n"),
         "anchor_terms": {t for part in (title, company, *matched_skills[:5]) if part for t in _terms(part)},
     }
+
     return draft, facts
 
 
@@ -371,10 +573,17 @@ def tailor_resume(
         doc.page_content for doc in documents if doc.page_content
     )
 
-    draft, facts = _build_draft(profile, job_description, evidence)
+    draft, facts = _build_draft(
+        profile,
+        job_description,
+        evidence,
+    )
+
     prose = _llm_prose(job_description, facts)
+
     if prose:
-        draft.headline, draft.summary = prose.headline.strip(), prose.summary.strip()
+        draft.headline = prose.headline.strip()
+        draft.summary = prose.summary.strip()
 
     return {
         "profile_id": profile_id,

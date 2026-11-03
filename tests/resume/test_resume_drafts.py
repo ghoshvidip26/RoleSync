@@ -63,12 +63,20 @@ def test_the_tailor_endpoint_keeps_its_response_and_adds_a_draft_id(fake_db):
     assert "evidence_used" not in saved                                               # the large evidence is not stored
 
 
-def test_the_draft_is_still_returned_if_it_cannot_be_saved():
-    broken = FakeDB(fail_insert=True)
-    with patch.object(main.db, "fetch", broken.fetch), patch.object(main.db, "insert", broken.insert):
+def test_a_draft_that_cannot_be_saved_fails_instead_of_returning_a_draft_that_cannot_be_reviewed():
+    """A missing table gives the clear 503; any other save failure is a 500. Either way the caller is told,
+    instead of receiving a draft with no id that can never be approved."""
+    missing = FakeDB(fail_insert=True)                                   # raises: relation "public.resume_drafts" does not exist
+    with patch.object(main.db, "fetch", missing.fetch), patch.object(main.db, "insert", missing.insert):
         response = tailor()
-    assert response.status_code == 200 and response.json()["draft_id"] is None
-    assert response.json()["draft"] == DRAFT
+    assert response.status_code == 503 and "supabase/schema.sql" in response.json()["detail"]
+
+    def broken(table, data):
+        raise RuntimeError("connection reset")
+
+    with patch.object(main.db, "fetch", FakeDB().fetch), patch.object(main.db, "insert", broken):
+        response = tailor()
+    assert response.status_code == 500 and response.json()["detail"] == "Failed to persist resume draft."
 
 
 def test_a_saved_draft_can_be_read_and_listed_newest_first(fake_db):
@@ -165,7 +173,7 @@ def test_an_edit_with_no_fields_is_rejected(fake_db):
     assert fake_db.rows["d1"]["draft"] == DRAFT
 
 
-@pytest.mark.parametrize("body", [{"headline": "x" * 121}, {"summary": "y" * 351}, {"headline": 5}])
+@pytest.mark.parametrize("body", [{"headline": "x" * 121}, {"summary": "y" * 601}, {"headline": 5}])
 def test_over_long_or_wrongly_typed_values_are_rejected_and_nothing_is_saved(fake_db, body):
     tailor()
     assert edit(body).status_code == 422
@@ -196,3 +204,52 @@ def test_editing_with_a_missing_table_gives_the_clear_503():
     with patch.object(main.db, "fetch", missing_table):
         response = edit({"headline": "x"})
     assert response.status_code == 503 and "supabase/schema.sql" in response.json()["detail"]
+
+
+def test_a_summary_of_exactly_the_limit_is_accepted(fake_db):
+    tailor()
+    assert edit({"summary": "y" * 600}).status_code == 200
+
+
+# --- editing the rest of the draft ---------------------------------------------------------------------------
+
+ROLE = {"company": "PayLoop", "job_title": "Backend Engineer", "duration": "2020 – 2021", "location": "Pune", "bullets": ["Cut latency 45%."]}
+PROJECT = {"name": "StreamLite", "technologies": ["Go"], "description": None, "bullets": ["Built an engine."]}
+
+
+def test_skills_achievements_and_education_can_be_replaced_as_lists(fake_db):
+    tailor()
+    body = edit({"skills": ["Python", "Go"], "achievements": ["Won a hackathon."], "education": [{"details": "B.Tech"}]}).json()["draft"]
+    assert body["skills"] == ["Python", "Go"] and body["achievements"] == ["Won a hackathon."] and body["education"] == [{"details": "B.Tech"}]
+    assert body["headline"] == DRAFT["headline"]                         # fields that were not sent are untouched
+
+
+def test_experience_and_projects_can_be_replaced_with_structured_entries(fake_db):
+    tailor()
+    draft = edit({"experience": [ROLE], "projects": [PROJECT]}).json()["draft"]
+    assert draft["experience"] == [ROLE] and draft["projects"] == [PROJECT]
+
+
+@pytest.mark.parametrize("field", ["skills", "achievements", "education", "experience", "projects"])
+def test_sending_null_for_a_list_clears_it(fake_db, field):
+    tailor()
+    edit({"skills": ["Python"], "experience": [ROLE]})
+    assert edit({field: None}).json()["draft"][field] == []
+
+
+@pytest.mark.parametrize("body", [
+    {"skills": "Python"},                                   # must be a list
+    {"experience": [{"company": "PayLoop"}]},               # job_title is required
+    {"projects": [{"technologies": ["Go"]}]},               # name is required
+    {"achievements": [1, 2]},
+])
+def test_malformed_list_edits_are_rejected_and_nothing_is_saved(fake_db, body):
+    tailor()
+    assert edit(body).status_code == 422
+    assert fake_db.rows["d1"]["draft"] == DRAFT
+
+
+def test_the_empty_edit_message_lists_every_editable_field(fake_db):
+    tailor()
+    detail = edit({}).json()["detail"]
+    assert all(field in detail for field in ("headline", "summary", "skills", "experience", "projects", "achievements", "education"))

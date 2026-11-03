@@ -8,8 +8,9 @@ from unittest.mock import MagicMock
 
 # Ensure testing environment variables
 os.environ["INDEX_DIR"] = tempfile.mkdtemp(prefix="test_indexes_")
-os.environ["OLLAMA_CHAT_MODEL"] = "qwen:latest"
-os.environ["OLLAMA_EMBEDDING_MODEL"] = "nomic-embed-text"
+# Defaults only: set these variables yourself to run the live test with the models you have installed.
+os.environ.setdefault("OLLAMA_CHAT_MODEL", "qwen:latest")
+os.environ.setdefault("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 
 
 @pytest.fixture(autouse=True)

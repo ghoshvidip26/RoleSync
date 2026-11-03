@@ -69,10 +69,10 @@ def test_without_a_tailored_resume_the_prompt_is_unchanged():
 
 def test_the_fallback_template_leads_with_the_tailored_skills_and_result():
     draft = oa._template_email(PROFILE, COMPANY, RECIPIENT, TAILORED)
-    assert "I work mainly with Redis, PostgreSQL, Docker." in draft.body
-    assert "For example: Cut query latency 45% with a Redis caching layer in front of PostgreSQL" in draft.body
+    assert "I work mainly with Redis, PostgreSQL and Docker." in draft.body
+    assert "• Cut query latency 45% with a Redis caching layer in front of PostgreSQL" in draft.body
     plain = oa._template_email(PROFILE, COMPANY, RECIPIENT)
-    assert "I work mainly with Python, Kubernetes, PostgreSQL." in plain.body          # no draft: as before
+    assert "I work mainly with Python, Kubernetes, PostgreSQL, Redis and Docker." in plain.body          # no draft: as before
 
 
 def test_an_email_still_cannot_claim_something_the_tailored_resume_only_listed_as_a_claim_to_confirm():
@@ -80,7 +80,7 @@ def test_an_email_still_cannot_claim_something_the_tailored_resume_only_listed_a
             "so I'd love to hear how Cyberdyne Systems thinks about performance. Would you be open to a short conversation?"
             "\n\nBest regards,\nSarah Connor")
     result, _ = run_agent(TAILORED, body)
-    assert result.subject == "Sarah Connor: interested in opportunities at Cyberdyne Systems"   # Terraform is not in the resume
+    assert result.subject == "Sarah Connor: Backend Engineer interested in Cyberdyne Systems"   # Terraform is not in the resume
 
 
 def test_an_email_that_uses_the_tailored_emphasis_is_accepted():
@@ -88,7 +88,7 @@ def test_an_email_that_uses_the_tailored_emphasis_is_accepted():
             "to hear how Cyberdyne Systems thinks about performance. Would you be open to a short conversation?"
             "\n\nBest regards,\nSarah Connor")
     result, _ = run_agent(TAILORED, body)
-    assert "cut query latency 45%" in result.body and "interested in opportunities" not in result.subject
+    assert "cut query latency 45%" in result.body and "interested in Cyberdyne" not in result.subject
 
 
 # --- the endpoint ----------------------------------------------------------------------------------
@@ -154,3 +154,50 @@ def test_without_a_draft_id_outreach_behaves_exactly_as_before():
     assert response.status_code == 201
     assert "resume_draft_id" not in inserted[0]                       # works before the emails.resume_draft_id column exists
     assert run.call_args.kwargs["tailored"] is None
+
+
+# --- the current, complete draft shape ---------------------------------------------------------------------------
+
+NEW_SHAPE = {
+    "headline": "Backend Engineer | Python, Redis",
+    "summary": "Backend Engineer at PayLoop. Skilled in Python, Redis.",
+    "skills": ["Redis", "PostgreSQL", "Docker"],
+    "experience": [
+        {"company": "PayLoop", "job_title": "Backend Engineer", "duration": "Jun 2020 – Dec 2021", "location": "Pune",
+         "bullets": ["Cut query latency 45% with a Redis caching layer in front of PostgreSQL.", "Designed REST APIs for payments."]},
+        {"company": "Acme", "job_title": "Intern", "bullets": ["Wrote scripts."]},
+    ],
+    "projects": [{"name": "StreamLite", "technologies": ["Go"], "bullets": ["Built an engine."]},
+                 {"name": "LedgerCheck", "technologies": [], "bullets": []}, {"name": "Third", "technologies": [], "bullets": []}],
+    "achievements": ["Won a hackathon."], "education": [{"details": "B.Tech"}],
+    "recommendations": ["Prioritize these matching skills: Redis"],
+    "claims_requiring_confirmation": ["Terraform: requested by the job description but not found in the resume."],
+}
+
+
+def test_the_current_draft_shape_is_understood():
+    facts = oa._tailored_facts(NEW_SHAPE)
+    assert facts["skills"] == ["Redis", "PostgreSQL", "Docker"]
+    assert facts["bullet"] == "Cut query latency 45% with a Redis caching layer in front of PostgreSQL."
+    assert facts["projects"] == ["StreamLite", "LedgerCheck"]                       # the two most relevant
+    assert "Terraform" not in facts["text"] and "Prioritize" not in facts["text"]
+
+
+def test_a_long_skills_list_is_cut_to_the_top_few():
+    many = {**NEW_SHAPE, "skills": [f"Skill{i}" for i in range(40)]}
+    assert oa._tailored_facts(many)["skills"] == [f"Skill{i}" for i in range(5)]
+
+
+def test_an_approved_current_draft_changes_the_email_prompt_and_the_template():
+    _, messages = run_agent(NEW_SHAPE)
+    prompt = " ".join(text for _, text in messages)
+    assert "Skills to emphasise: Redis, PostgreSQL, Docker" in prompt and "Projects to mention: StreamLite, LedgerCheck" in prompt
+    assert "A result to mention: Cut query latency 45%" in prompt and "Terraform" not in prompt
+    body = oa._template_email(PROFILE, COMPANY, RECIPIENT, NEW_SHAPE).body
+    assert "I work mainly with Redis, PostgreSQL and Docker." in body and "• Cut query latency 45%" in body
+
+
+def test_an_empty_or_unrelated_dict_adds_nothing():
+    for odd in ({}, {"skills": None, "experience": "text", "projects": [None, 5]}, {"experience": [{"bullets": [None]}]}):
+        facts = oa._tailored_facts(odd)
+        assert facts["lines"] == [] and facts["text"] == ""

@@ -7,7 +7,7 @@ import pytest
 
 from app.agents import resume_tailor
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_default_index_dir_does_not_depend_on_the_working_directory(tmp_path):
@@ -54,3 +54,18 @@ def test_an_index_built_with_another_embedding_model_is_reported_not_crashed_on(
     assert "16-dimensional" in caplog.text and "64-dimensional" in caplog.text and "re-upload" in caplog.text
     oa.clear_index_cache()
     oa._embedding_dimension.cache_clear()
+
+
+def test_every_chat_model_comes_from_the_one_setting():
+    """Regression: review.py had "qwen:latest" written into it, so OLLAMA_CHAT_MODEL did not switch it."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); "
+            "from app.agents import review, resume_tailor; from app.services import outreach_agent as oa; "
+            "print(review.review_agent.model, resume_tailor.tailor_agent.model, oa.get_llm().model)")
+    out = subprocess.run([sys.executable, "-W", "ignore", "-c", code], cwd=root,
+                         env={"PATH": "/usr/bin:/bin", "OLLAMA_CHAT_MODEL": "some-other-model:1b"}, capture_output=True, text=True)
+    assert out.stdout.split() == ["some-other-model:1b"] * 3, out.stderr[-300:]

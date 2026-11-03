@@ -18,6 +18,29 @@ SUPPORTED_LAYOUTS = {"single_column", "two_column", "complex"}
 def _safe_round(value: float, digits: int = 2) -> float:
     return round(float(value), digits)
 
+def _detect_page_size(width: float, height: float) -> str:
+    """Identify common PDF page sizes in points."""
+
+    known_sizes = {
+        "A4": (595.28, 841.89),
+        "Letter": (612.0, 792.0),
+        "Legal": (612.0, 1008.0),
+    }
+
+    for name, (expected_width, expected_height) in known_sizes.items():
+        if (
+            abs(width - expected_width) < 3
+            and abs(height - expected_height) < 3
+        ):
+            return name
+
+        if (
+            abs(width - expected_height) < 3
+            and abs(height - expected_width) < 3
+        ):
+            return f"{name} Landscape"
+
+    return "custom"
 
 def _page_layout(page: pymupdf.Page) -> dict[str, Any]:
     page_rect = page.rect
@@ -164,7 +187,15 @@ def analyze_resume_layout(pdf_bytes: bytes) -> dict[str, Any]:
                 "layout_type": overall,
                 "confidence": confidence,
                 "page_count": doc.page_count,
-                "page_size": "A4" if all(abs(p["width"] - 595.28) < 3 and abs(p["height"] - 841.89) < 3 for p in pages) else "custom",
+                "page_size": (
+                        _detect_page_size(pages[0]["width"], pages[0]["height"])
+                        if all(
+                            _detect_page_size(p["width"], p["height"])
+                            == _detect_page_size(pages[0]["width"], pages[0]["height"])
+                            for p in pages
+                        )
+                        else "mixed"
+                    ),
                 "pages": pages,
                 "recommended_action": (
                     "preserve_layout" if overall in {"single_column", "two_column"} and confidence >= 0.65
