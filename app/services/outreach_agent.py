@@ -12,6 +12,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
 from app.models.company import Company
+from app.services.llm_fallback import FallbackChat
 from app.models.profile import Profile
 from app.models.recipient import Recipient
 
@@ -45,9 +46,9 @@ def get_embeddings() -> OllamaEmbeddings:
 
 
 @lru_cache
-def get_llm(temperature: float = 0.0) -> ChatOllama:
-    """Returns ChatOllama configured with the given temperature."""
-    return ChatOllama(model=CHAT_MODEL, temperature=temperature)
+def get_llm(temperature: float = 0.0) -> FallbackChat:
+    """The chat model with the given temperature: local first, Groq if a call fails (see llm_fallback.py)."""
+    return FallbackChat(ChatOllama(model=CHAT_MODEL, temperature=temperature), label="email model")
 
 
 # A single experience/project entry stays one document up to this size. Longer entries are

@@ -14,6 +14,13 @@ os.environ.setdefault("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 
 
 @pytest.fixture(autouse=True)
+def no_cloud_fallback(monkeypatch):
+    """The developer's .env holds a real GROQ_API_KEY; tests must never send anything to Groq."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def cleanup_test_indexes():
     """Clear test indexes directory and cache before each test."""
     from app.services import outreach_agent

@@ -5,6 +5,8 @@ import re
 from typing import Annotated
 
 from langchain_ollama import ChatOllama
+
+from app.services.llm_fallback import FallbackChat
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agents.review import _JUNK, _THIRD_PERSON, _WORD, _norm, _terms, _tokens  # shared text helpers
@@ -156,14 +158,14 @@ def _absent_technical_terms(job_description: str, known: set[str]) -> list[str]:
 
 # The model only rewrites the headline and summary. Everything else in the draft is selected from the
 # resume in code, and the model's text is used only if it passes the checks below.
-tailor_agent = ChatOllama(
+tailor_agent = FallbackChat(ChatOllama(
     model=CHAT_MODEL,           # OLLAMA_CHAT_MODEL switches it, e.g. to a stronger model
     temperature=0.3,
     repeat_penalty=1.15,
     num_ctx=4096,
     num_predict=300,            # a short answer is all that is needed; this stops runaway loops early
     client_kwargs={"timeout": 60},
-)
+), label="tailoring model")     # if the call fails, Groq answers (see app/services/llm_fallback.py)
 
 
 class _Prose(BaseModel):

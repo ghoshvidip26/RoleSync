@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -361,3 +362,57 @@ def test_a_summary_that_pins_one_jobs_title_on_another_employer_is_rejected():
     for text, expected in ((wrong, None), (right, right), ("Python and Kafka specialist | PayLoop", None)):
         llm = FakeLLM(["Python", "Kafka"], [a(1, "matching"), a(2, "matching")], {**EMPTY_DRAFT, "summary": text})
         assert result(run(llm, profile=profile, jd="Python and Kafka.")[0])[1]["summary"] == expected
+
+
+# --- the reasoning is a short summary, not a run-on copy of the lists below it (seen in the UI) ---------------------
+
+LONG_REQUIREMENTS = [
+    "Strong proficiency in TypeScript, React, Next.js",
+    "1-3 years of professional experience building full-stack applications and shipping them to real customers",
+    "Solid backend experience with Python and FastAPI",
+    "Working knowledge of PostgreSQL and MongoDB or similar relational/NoSQL databases",
+    "Hands-on experience with at least one AI agent framework (LangChain, LangGraph, Pydantic AI, or equivalent)",
+    "Regular use of an AI coding assistant (e. g., Claude Code, Cursor, or similar) as part of your development workflow",
+    "Iterate fast -- from prototype to production -- in a 0-to-1 product environment",
+    "Experience mentoring an intern, junior engineer, or peer -- or clear readiness to take on mentorship",
+]
+
+
+def test_the_reasoning_is_a_short_readable_summary_that_is_never_cut_mid_word():
+    llm = FakeLLM(LONG_REQUIREMENTS, [a(1, "matching", "TypeScript"), *[a(i, "uncertain") for i in range(2, 8)], a(8, "matching", "mentored interns")],
+                  EMPTY_DRAFT)
+    fa, _ = result(run(llm, jd="\n".join(f"- {r}" for r in LONG_REQUIREMENTS))[0])
+    reasoning = fa["reasoning"]
+    assert len(reasoning) <= 450, len(reasoning)                               # was a run-on cut at 600 characters
+    assert re.match(r"^\w+ match: \d of 8 job requirements (?:are|is) clearly covered\.", reasoning)
+    assert reasoning.endswith(".") and "(La" not in reasoning                  # complete sentences, no cut-off text
+    assert "Unclear:" not in reasoning and "Not demonstrated" not in reasoning   # the lists below say that
+    # no requirement is copied in full when it is long; each item is shortened at a word boundary
+    for item in [*fa["gaps"], *fa["uncertain_requirements"]]:
+        head = item.split(" — ")[0]
+        if len(head) > 75:
+            assert head not in reasoning
+    for piece in re.findall(r"([A-Za-z-]+)…", reasoning):                      # an ellipsis always follows a whole word
+        assert any(piece in req.split() or piece in req.replace(",", "").split() for req in LONG_REQUIREMENTS), piece
+
+
+def test_nothing_missing_and_nothing_unclear_reads_cleanly():
+    reasoning = result(run(FakeLLM(["React Native", "TypeScript"], [a(1, "matching"), a(2, "matching", "TypeScript, FAISS")], EMPTY_DRAFT))[0])[0]["reasoning"]
+    assert "Nothing is clearly missing." in reasoning and "only partly shown" not in reasoning
+
+
+def test_long_requirement_text_is_shortened_at_a_word_boundary():
+    long_req = "Experience designing and operating highly available distributed systems across multiple cloud regions"
+    jd = f"- {long_req}\n- Kubernetes"
+    reasoning = result(run(FakeLLM([long_req, "Kubernetes"], [a(1, "gap"), a(2, "gap")], EMPTY_DRAFT), jd=jd)[0])[0]["reasoning"]
+    missing = reasoning.split("Missing: ")[1]
+    assert "Experience designing and operating highly available distributed…" in missing   # cut after a whole word
+    assert "systems across" not in missing and "Kubernetes" in missing
+
+
+def test_word_safe_never_cuts_inside_a_word():
+    text = "First sentence here. Second sentence is considerably longer than the first one is. " * 8
+    for limit in (40, 100, 333, 599):
+        out = review._word_safe(text, limit)
+        assert len(out) <= limit + 1 and (out.endswith((".", "…")))
+    assert review._word_safe("short", 600) == "short"

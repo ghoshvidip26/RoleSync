@@ -4,6 +4,9 @@ import re
 from typing import Annotated, Any, Literal
 
 from langchain_ollama import ChatOllama
+
+from app.services import llm_fallback
+from app.services.llm_fallback import FallbackChat
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.services.outreach_agent import CHAT_MODEL, experience_metadata, get_retriever, parse_entry, project_metadata
@@ -85,12 +88,12 @@ class ResumeDraft(BaseModel):
 
 # temperature=0 (greedy decoding) makes this model fall into repetition loops that Ollama
 # aborts, so use light sampling plus a repeat penalty. The output schema is passed per call.
-review_agent = ChatOllama(
+review_agent = FallbackChat(ChatOllama(
     model=CHAT_MODEL,           # OLLAMA_CHAT_MODEL switches it, same as the tailoring and email code
     temperature=0.3,
     repeat_penalty=1.15,
     num_ctx=8192,
-)
+), label="review model")        # if a call fails, Groq answers (see app/services/llm_fallback.py)
 
 REQUIREMENTS_PROMPT = """
 You extract the requirements from a job description.
@@ -289,9 +292,20 @@ def _restore_hyphens_in(value: Any, source: str) -> Any:
 def _generate(schema: type[BaseModel], messages: list[tuple[str, str]]) -> BaseModel:
     """Call the model with a schema-constrained output; retry once if the call or output fails."""
     last_error = "unknown error"
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    attempt = 0
+    while True:
+        attempt += 1
+        # A call that fails is answered by Groq inside `review_agent`. When the local model only ever returned
+        # unusable JSON, one last try goes to Groq directly.
+        use_groq = attempt > MAX_ATTEMPTS
+        if use_groq and not (last_error.startswith("invalid response") and llm_fallback.groq_available() and attempt == MAX_ATTEMPTS + 1):
+            break
         try:
-            content = review_agent.invoke(messages, format=schema.model_json_schema()).content
+            if use_groq:
+                logger.warning("Review model gave unusable output twice; asking Groq once.")
+                content = llm_fallback.groq_invoke(messages, schema.model_json_schema()).content
+            else:
+                content = review_agent.invoke(messages, format=schema.model_json_schema()).content
         except Exception as exc:  # Ollama down, model missing, generation aborted, ...
             last_error = f"model call failed: {exc}"
             logger.warning("Review attempt %d failed: %s", attempt, exc)
@@ -306,7 +320,7 @@ def _generate(schema: type[BaseModel], messages: list[tuple[str, str]]) -> BaseM
                 ("assistant", content),
                 ("human", f"That response was invalid ({last_error}). Return only the requested JSON."),
             ]
-    raise ReviewError(f"Profile Review Agent failed after {MAX_ATTEMPTS} attempts: {last_error}")
+    raise ReviewError(f"Profile Review Agent failed after {attempt - 1} attempts: {last_error}")
 
 
 def _traceable_requirements(items: list[str], job_description: str) -> list[str]:
@@ -697,6 +711,15 @@ def _sanitize_updates(draft: ResumeDraft, cand: _Candidate, jd_terms: set[str], 
     )
 
 
+def _word_safe(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters at a sentence or word boundary, never in the middle of a word."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    sentence = max(head.rfind(". "), head.rfind("; "))
+    return head[: sentence + 1] if sentence > limit // 2 else head.rsplit(" ", 1)[0].rstrip(",;:( ") + "…"
+
+
 def _reasoning(draft_text: str, verdict: str, lists: dict[str, list[str]], cand: _Candidate, sources: list[str | None]) -> str:
     """Use the model's reasoning only when it talks about this job's requirements, names the job or
     project that backs a strength, and does not present a gap as a strength. Otherwise state the
@@ -714,19 +737,30 @@ def _reasoning(draft_text: str, verdict: str, lists: dict[str, list[str]], cand:
     if text and specific and cites_evidence and not claims_gap:
         return text
 
-    def names(items: list[str]) -> str:
-        return "; ".join(items[:4]) or "none"
+    def short(item: str, limit: int = 70) -> str:
+        """`item` cut at a word boundary (never mid-word), with an ellipsis if it was cut."""
+        item = " ".join(item.split()).rstrip(".")
+        return item if len(item) <= limit else item[:limit].rsplit(" ", 1)[0].rstrip(",;:( ") + "…"
 
-    supported = [f"{h} ({src})" if src else h for h, src in zip(heads["matching"], sources)]
+    def names(items: list[str], limit: int = 3) -> str:
+        shown = "; ".join(items[:limit])
+        return shown + (f"; and {len(items) - limit} more" if len(items) > limit else "")
+
+    supported = [f"{short(h)} ({src})" if src else short(h) for h, src in zip(heads["matching"], sources)]
     total = sum(len(v) for v in lists.values())
-    fallback = (
-        f"{verdict.replace('_', ' ').capitalize()}: {len(lists['matching'])} of {total} job requirements are "
-        f"supported by the profile ({names(supported)}). "
-        f"Not demonstrated: {names(heads['gaps'])}. Unclear: {names(heads['uncertain'])}."
-    )
+    covered, unclear = len(lists["matching"]), len(lists["uncertain"])
+    sentences = [
+        f"{verdict.replace('_', ' ').capitalize()}: "
+        + (f"{covered} of {total} job requirements are clearly covered." if covered else f"none of the {total} job requirements is clearly covered.")
+    ]
+    if supported:
+        sentences.append(f"Covered: {names(supported, 2)}.")
+    sentences.append(f"Missing: {names([short(g) for g in heads['gaps']])}." if heads["gaps"] else "Nothing is clearly missing.")
+    if unclear:
+        sentences.append(f"{unclear} other{'' if unclear == 1 else 's'} {'is' if unclear == 1 else 'are'} only partly shown (see the unclear list).")
     if not cand.has_work:
-        fallback += " The profile has no work experience or project entries to check against."
-    return fallback[:600]
+        sentences.append("The profile has no work experience or project entries to check against.")
+    return " ".join(sentences)
 
 
 def _section(doc) -> str | None:
@@ -832,7 +866,7 @@ def orchestrate(profile_id: str, profile: dict, job_description: str) -> dict:
     result = ReviewResult(
         fit_assessment=FitAssessment(
             verdict=verdict,
-            reasoning=_reasoning(draft.reasoning, verdict, lists, cand, sources)[:600],
+            reasoning=_word_safe(_reasoning(draft.reasoning, verdict, lists, cand, sources), 600),
             matching_requirements=lists["matching"],
             gaps=lists["gaps"],
             uncertain_requirements=lists["uncertain"],
