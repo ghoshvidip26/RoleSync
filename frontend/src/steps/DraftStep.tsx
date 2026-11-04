@@ -7,8 +7,9 @@ import {
   Wand2,
 } from 'lucide-react'
 import { approveDraft, editDraft, rejectDraft, tailorResume } from '../api.ts'
+import { PositioningSection } from '../components/PositioningSection.tsx'
 import { useFlow } from '../flow.tsx'
-import { draftChanges, errorText, parseLines, problemsIn } from '../lib.ts'
+import { draftChanges, errorText, parseLines, problemsIn, profileSkillList } from '../lib.ts'
 import type { DraftRecord, ExperienceItem, ProjectItem, ResumeDraft } from '../types.ts'
 import {
   Badge,
@@ -140,7 +141,7 @@ export function DraftStep({ onNext }: { onNext: () => void }) {
     setBusy(true)
     setError(null)
     try {
-      const out = await tailorResume(flow.profile.id, flow.job.description.trim())
+      const out = await tailorResume(flow.profile.id, flow.job.description.trim(), flow.job.title)
       if (!out.draft_id) throw new Error('The draft could not be saved. Try again.')
       update({
         draft: {
@@ -148,6 +149,14 @@ export function DraftStep({ onNext }: { onNext: () => void }) {
           profile_id: flow.profile.id,
           status: 'pending_review',
           draft: out.draft,
+        },
+        // what the AI wrote for the positioning fields, so the page can tell it apart from the user's edits
+        positioning: {
+          draftId: out.draft_id,
+          headline: out.draft.headline ?? '',
+          summary: out.draft.summary ?? '',
+          skills: out.draft.skills ?? [],
+          variants: { headline: 0, summary: 0, skills: 0 },
         },
         template: null,
         emailId: null,
@@ -201,7 +210,7 @@ function DraftEditor({
   onRegenerate: () => Promise<void>
   generating: boolean
 }) {
-  const { update } = useFlow()
+  const { flow, update } = useFlow()
   const [edited, setEdited] = useState<ResumeDraft>(record.draft)
   const [busy, setBusy] = useState<null | 'saving' | 'approving' | 'rejecting'>(null)
   const [error, setError] = useState<string | null>(null)
@@ -308,24 +317,13 @@ function DraftEditor({
       {/* Editor Fields */}
       <div className="stack space-y-5">
         <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-5 space-y-4">
-          <TextInput
-            label="Headline"
-            value={edited.headline ?? ''}
-            onChange={(v) => set({ headline: v })}
-            maxLength={120}
-          />
-          <TextArea
-            label="Summary"
-            value={edited.summary ?? ''}
-            onChange={(v) => set({ summary: v })}
-            rows={3}
-            maxLength={600}
-          />
-          <TagsInput
-            label="Skills to highlight"
-            value={edited.skills}
-            onChange={(v) => set({ skills: v })}
-            hint="These move to the front of their skill groups. Your skills are never removed."
+          <PositioningSection
+            draftId={record.id}
+            values={{ headline: edited.headline ?? '', summary: edited.summary ?? '', skills: edited.skills }}
+            onChange={(patch) => set(patch)}
+            profileSkills={profileSkillList(flow.profile)}
+            jobTitle={flow.job.title}
+            locked={locked}
           />
         </div>
 

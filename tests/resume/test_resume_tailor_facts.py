@@ -38,12 +38,11 @@ def test_tailor_resume_runs_end_to_end_when_the_model_is_unavailable():
 def test_a_verified_model_text_is_used_through_the_same_facts():
     retriever = MagicMock()
     retriever.invoke.return_value = [Document(page_content="Backend Engineer | PayLoop", metadata={})]
-    good = ('{"headline": "Backend Engineer | Python, Redis", "summary": "Backend engineer at PayLoop who cut query latency 45% '
-            'using Redis and Python."}')
+    good = '{"summary": "Backend engineer at PayLoop who cut query latency 45% using Redis and Python."}'
     agent = MagicMock(invoke=MagicMock(return_value=MagicMock(content=good)))
     with patch.object(rt, "get_retriever", return_value=retriever), patch.object(rt, "tailor_agent", agent):
         draft = rt.tailor_resume("p1", PROFILE, JD)["draft"]
-    assert draft["headline"] == "Backend Engineer | Python, Redis" and "cut query latency 45%" in draft["summary"]
+    assert draft["headline"] and "cut query latency 45%" in draft["summary"]
 
 
 FULL_PROFILE = {

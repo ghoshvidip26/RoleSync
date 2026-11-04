@@ -127,10 +127,19 @@ export const recommendRoles = (profileId: string) =>
 export const reviewFit = (profileId: string, jobDescription: string) =>
   json<ReviewResult>(`/profiles/${profileId}/review`, { ...post({ job_description: jobDescription }), timeoutMs: SLOW_MS })
 
-export const tailorResume = (profileId: string, jobDescription: string) =>
+export const tailorResume = (profileId: string, jobDescription: string, jobTitle = '') =>
   json<{ draft_id: string | null; status: string; draft: ResumeDraft }>(`/profiles/${profileId}/tailor-resume`, {
-    ...post({ job_description: jobDescription }),
+    // the job title is sent only when the user gave one, so the request is unchanged otherwise
+    ...post({ job_description: jobDescription, ...(jobTitle.trim() ? { job_title: jobTitle.trim() } : {}) }),
     timeoutMs: SLOW_MS,
+  })
+
+/** A new suggestion for one field of the positioning section. Nothing is saved: the page decides what to keep. */
+export type PositioningField = 'headline' | 'summary' | 'skills'
+export const suggestField = (draftId: string, field: PositioningField, variant: number, jobTitle = '') =>
+  json<{ field: PositioningField; variant: number; value: string | string[] | null }>(`/resume-drafts/${draftId}/suggest`, {
+    ...post({ field, variant, ...(jobTitle.trim() ? { job_title: jobTitle.trim() } : {}) }),
+    timeoutMs: 60_000,
   })
 
 export const getDraft = (draftId: string) => json<DraftRecord>(`/resume-drafts/${draftId}`)

@@ -93,10 +93,11 @@ def test_what_the_job_wants_but_the_resume_lacks_is_a_claim_to_confirm_never_a_s
         assert missing not in everything
 
 
-def test_headline_and_summary_use_the_real_title_employer_and_skills():
+def test_headline_and_summary_are_built_from_the_real_resume_and_the_matching_skills():
     d = draft()
-    assert d["headline"] == "Junior Mobile Developer | Python, PostgreSQL, Redis"
-    assert d["summary"].startswith("Junior Mobile Developer at Aforro. Skilled in Python, PostgreSQL, Redis, REST APIs")
+    assert d["headline"] == "Junior Mobile Developer | Python, PostgreSQL, Redis"        # no evidenced role in this JD: the real title
+    assert d["summary"].startswith("Mobile developer. Integrated rider payments and COD collection, supporting backend APIs.")
+    assert "Also hands-on with Python, PostgreSQL, Redis and REST APIs." in d["summary"]
 
 
 def test_every_original_bullet_is_kept_unchanged_with_the_most_relevant_first():
@@ -164,10 +165,9 @@ def test_input_checks_and_retrieval_errors_are_unchanged():
         tailor(retriever=failing)
 
 
-# --- the model rewrites the headline and summary; its text is verified, with the rule-based text as fallback ---
+# --- the model rewrites the summary; its text is verified, with the rule-based text as fallback ---
 
-GOOD = {"headline": "Mobile Developer | Python, PostgreSQL, Redis",
-        "summary": "Mobile developer at Aforro who integrated rider payments and COD collection while working with Python, PostgreSQL and Redis."}
+GOOD = {"summary": "Mobile developer at Aforro who integrated rider payments and COD collection while working with Python, PostgreSQL and Redis."}
 
 
 def tailor_with(answer):
@@ -176,12 +176,12 @@ def tailor_with(answer):
         return tailor(), llm
 
 
-def test_verified_model_text_replaces_only_the_headline_and_summary():
+def test_verified_model_text_replaces_only_the_summary():
     baseline = draft()
     out, llm = tailor_with(GOOD)
     d = out["draft"]
-    assert d["headline"] == GOOD["headline"] and d["summary"] == GOOD["summary"]
-    assert {k: v for k, v in d.items() if k not in ("headline", "summary")} == {k: v for k, v in baseline.items() if k not in ("headline", "summary")}
+    assert d["summary"] == GOOD["summary"] and d["summary"] != baseline["summary"]
+    assert {k: v for k, v in d.items() if k != "summary"} == {k: v for k, v in baseline.items() if k != "summary"}   # headline is rule-built
     assert len(llm.calls) == 1                                                       # one attempt, no retry loop
 
 
@@ -191,17 +191,14 @@ def test_the_model_is_only_given_verified_facts_not_the_job_descriptions_skills(
     assert "Python, PostgreSQL, Redis" in prompt and "Junior Mobile Developer at Aforro" in prompt
     for jd_only in ("Kafka", "FastAPI", "Kubernetes"):
         assert jd_only not in prompt                                                  # nothing to copy that the candidate lacks
-    assert llm.calls[0][1]["required"] == ["headline", "summary"]                    # `{}` is not an acceptable answer
+    assert llm.calls[0][1]["required"] == ["summary"]                                # `{}` is not an acceptable answer
 
 
 @pytest.mark.parametrize("bad", [
     {**GOOD, "summary": "Mobile developer at Aforro experienced with Kubernetes, Python and Redis for payment services."},   # skill only the job asks for
     {**GOOD, "summary": "Mobile developer at Aforro who cut costs by 70% working with Python, PostgreSQL and Redis."},        # invented number
     {**GOOD, "summary": "Mobile developer at Aforro who is fluent in TensorFlow with Python and PostgreSQL daily."},          # made-up technology
-    {**GOOD, "headline": "Senior Kafka Engineer | Python"},                                                                   # claims a JD-only skill
-    {**GOOD, "headline": "Backend Engineer | Python, PostgreSQL, Redis, REST APIs, Docker"},                                   # the job's title, never held
-    {**GOOD, "headline": "Backend Engineer at Aforro"},                                                                       # same, pinned on a real employer
-    {**GOOD, "headline": "Lead Mobile Developer | Python, Redis"},                                                            # adds seniority the candidate lacks
+    {"summary": "Backend Engineer at Aforro working with Python, PostgreSQL and Redis on payment services."},               # the job's title, never held
     {**GOOD, "summary": "Integrated rider payments and COD collection, supporting backend APIs. Optimized PostgreSQL schemas and queries for production features."},   # two pasted bullets
     {**GOOD, "summary": "I am a mobile developer at Aforro working with Python, PostgreSQL and Redis every day."},            # first person
     {**GOOD, "summary": "The candidate is a mobile developer at Aforro who works with Python, PostgreSQL and Redis."},         # third person
@@ -209,7 +206,7 @@ def test_the_model_is_only_given_verified_facts_not_the_job_descriptions_skills(
     {**GOOD, "summary": "Junior Mobile Developer | Aforro, Bengaluru with Python and PostgreSQL experience today."},          # pasted header
     {**GOOD, "summary": "Python Python Python Python Python Python Python Python Python Python Python Python."},               # repetition
     {**GOOD, "summary": "Mobile developer at Aforro."},                                                                       # too short
-    {"headline": "x", "summary": "short"},                                                                                    # below the schema minimums
+    {"summary": "short"},                                                                                                     # below the schema minimum
     {},                                                                                                                       # the empty answer that used to give a null draft
     {**GOOD, "extra": 1},                                                                                                     # unknown key
     "not json at all",
@@ -240,18 +237,12 @@ def test_the_model_is_not_called_when_there_is_nothing_verified_to_write_from():
     assert llm.calls == [] and d["summary"] == "Chef."
 
 
-def test_a_headline_may_drop_seniority_or_be_just_the_candidates_matching_skills():
-    for headline in ("Mobile Developer | Python, PostgreSQL", "Python, PostgreSQL, Redis", "Junior Mobile Developer at Aforro"):
-        out, _ = tailor_with({**GOOD, "headline": headline})
-        assert out["draft"]["headline"] == headline, headline
-
-
 def test_the_job_title_phrase_is_checked_as_a_phrase_not_word_by_word():
     # "backend" and "Engineer" both appear in this resume, but the candidate never held "Backend Engineer".
     profile = {**PROFILE, "experience": PROFILE["experience"] + ["Assistant System Engineer | TCS, Noida\n• Supported backend services."]}
-    llm = FakeLLM({**GOOD, "headline": "Backend Engineer | Python"})
-    with patch.object(rt, "tailor_agent", llm):
-        assert tailor(profile=profile)["draft"]["headline"] != "Backend Engineer | Python"
+    claim = {"summary": "Backend Engineer at TCS who supported backend services with Python and PostgreSQL every day."}
+    with patch.object(rt, "tailor_agent", FakeLLM(claim)):
+        assert tailor(profile=profile)["draft"]["summary"] != claim["summary"]
 
 
 def test_the_model_step_can_be_switched_off(monkeypatch):

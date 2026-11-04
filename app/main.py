@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import logging
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError, Field, field_validator
@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agents.review import ReviewError, orchestrate
 from app.agents.role_recommender import recommend_roles
 from app.agents.tailoring_decision import needs_tailoring
-from app.agents.resume_tailor import ResumeTailorError,tailor_resume
+from app.agents.resume_tailor import ResumeTailorError, suggest_field, tailor_resume
 from fastapi.responses import JSONResponse, Response
 from app.services.resume_pdf_renderers import original_resume, resume_layout_analyzer
 from app.services.resume_pdf_renderers import templates as resume_templates
@@ -362,6 +362,8 @@ def recommend_profile_roles(profile_id: str):
 
 class ResumeTailorRequest(BaseModel):
     job_description: str
+    # The job's title, if the user gave one: the headline is written for that role (when the resume supports it).
+    job_title: str | None = Field(default=None, max_length=100)
 
 def _save_resume_draft(profile_id: str, job_description: str, draft: dict) -> str | None:
     """Persist a generated resume draft for user review."""
@@ -401,7 +403,9 @@ def tailor_profile_resume(profile_id: str,data: ResumeTailorRequest):
             detail="Profile not found")
     try:
         result = tailor_resume(
-            profile_id=profile_id,profile=profile,job_description=data.job_description
+            profile_id=profile_id,profile=profile,job_description=data.job_description,
+            # only sent when given, so the call is unchanged for everyone who does not use it
+            **({"job_title": data.job_title.strip()} if data.job_title and data.job_title.strip() else {}),
         )
     except ResumeTailorError as exc:
         raise HTTPException(status_code=502,detail=str(exc))
@@ -452,6 +456,31 @@ def _review_resume_draft(draft_id: str, status: ResumeDraftStatus) -> ResumeDraf
         db.update, db.RESUME_DRAFTS, draft_id, {"status": status, "reviewed_at": datetime.now(timezone.utc)}
     )
     return ResumeDraftRecord(**updated)
+
+
+class PositioningSuggestRequest(BaseModel):
+    field: Literal["headline", "summary", "skills"]
+    variant: int = Field(default=0, ge=0, le=999)      # a different number gives a different suggestion
+    job_title: str | None = Field(default=None, max_length=100)
+
+
+@app.post("/resume-drafts/{draft_id}/suggest")
+def suggest_positioning(draft_id: str, data: PositioningSuggestRequest):
+    """A fresh suggestion for ONE field of a draft's positioning section (headline, summary or skills to highlight).
+
+    Nothing is saved or changed: the caller decides whether to use it (PATCH /resume-drafts/{id}). Built from the
+    candidate's profile and the draft's job description only. Only drafts still pending review.
+    """
+    record = _get_resume_draft(draft_id)
+    if record.status != ResumeDraftStatus.PENDING_REVIEW:
+        raise HTTPException(409, f"Only drafts pending review can get new suggestions (current: {record.status.value})")
+    profile = _get_entity(db.PROFILES, record.profile_id)
+    try:
+        value = suggest_field(profile, record.job_description, data.field, variant=data.variant,
+                              job_title=(data.job_title or "").strip() or None)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {"field": data.field, "variant": data.variant, "value": value}
 
 
 @app.post("/resume-drafts/{draft_id}/approve", response_model=ResumeDraftRecord)

@@ -78,3 +78,59 @@ export function problemsIn(d: ResumeDraft): string[] {
   if ((d.summary ?? '').length > 600) out.push('The summary can be at most 600 characters.')
   return out
 }
+
+// ---- skills: only skills the candidate's profile already has can be highlighted ----------------------------------
+
+/** "React Native", "react-native" and "React.Native" are one skill. */
+export const skillKey = (skill: string) => skill.toLowerCase().replace(/[^a-z0-9+#]/g, '')
+
+/** Every skill in the profile, once each: languages, frameworks and tools first, then the general skills list (which also
+ * holds concepts such as "OOP"), so the most useful ones lead when skills are offered. */
+export function profileSkillList(
+  profile: Pick<ProfileData, 'skills' | 'programming_languages' | 'frameworks' | 'databases_tools'> | null,
+): string[] {
+  if (!profile) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const field of [profile.programming_languages, profile.frameworks, profile.databases_tools, profile.skills]) {
+    for (const entry of field ?? []) {
+      for (const part of entry.split(',')) {
+        const skill = part.trim()
+        const key = skillKey(skill)
+        if (key && !seen.has(key)) {
+          seen.add(key)
+          out.push(skill)
+        }
+      }
+    }
+  }
+  return out
+}
+
+/** The profile's own spelling of what was typed, or null when the profile has no such skill. */
+export const findProfileSkill = (text: string, list: string[]): string | null => {
+  const key = skillKey(text)
+  return key ? (list.find((s) => skillKey(s) === key) ?? null) : null
+}
+
+/** Profile skills that start with, or contain, what was typed (best first). */
+export function matchingProfileSkills(text: string, list: string[], taken: string[], limit = 6): string[] {
+  const key = skillKey(text)
+  if (!key) return []
+  const used = new Set(taken.map(skillKey))
+  const open = list.filter((s) => !used.has(skillKey(s)) && skillKey(s).includes(key))
+  return [...open.filter((s) => skillKey(s).startsWith(key)), ...open.filter((s) => !skillKey(s).startsWith(key))].slice(0, limit)
+}
+
+/** Skills to offer as one-click additions: the profile's skills that are not highlighted yet, those the AI had
+ * suggested first (so a removed suggestion is easy to bring back), then the rest in profile order. */
+export function recommendSkills(list: string[], selected: string[], suggested: string[], limit = 12): string[] {
+  const used = new Set(selected.map(skillKey))
+  const open = list.filter((s) => !used.has(skillKey(s)))
+  const wanted = new Set(suggested.map(skillKey))
+  return [...open.filter((s) => wanted.has(skillKey(s))), ...open.filter((s) => !wanted.has(skillKey(s)))].slice(0, limit)
+}
+
+/** Same skills in the same order, ignoring spelling differences. */
+export const sameSkills = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && a.every((s, i) => skillKey(s) === skillKey(b[i]))

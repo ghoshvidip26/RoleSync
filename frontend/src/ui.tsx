@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type ReactNode } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import {
   AlertCircle,
   AlertTriangle,
@@ -114,20 +114,24 @@ export function Badge({
 export function Field({
   label,
   hint,
+  actions,
   children,
 }: {
   label: string
   hint?: string
+  /** Controls (badges, buttons) shown on the right of the label row. */
+  actions?: ReactNode
   children: (id: string) => ReactNode
 }) {
   const id = useId()
   return (
     <div className="field">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <label htmlFor={id}>{label}</label>
-        {hint && <span className="muted small">{hint}</span>}
+        {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : hint && <span className="muted small">{hint}</span>}
       </div>
       {children(id)}
+      {actions && hint && <span className="muted small">{hint}</span>}
     </div>
   )
 }
@@ -139,6 +143,8 @@ export function TextInput({
   hint,
   type = 'text',
   maxLength,
+  actions,
+  disabled,
 }: {
   label: string
   value: string
@@ -146,15 +152,18 @@ export function TextInput({
   hint?: string
   type?: string
   maxLength?: number
+  actions?: ReactNode
+  disabled?: boolean
 }) {
   return (
-    <Field label={label} hint={hint}>
+    <Field label={label} hint={hint} actions={actions}>
       {(id) => (
         <input
           id={id}
           type={type}
           value={value}
           maxLength={maxLength}
+          disabled={disabled}
           onChange={(e) => onChange(e.target.value)}
         />
       )}
@@ -169,6 +178,9 @@ export function TextArea({
   hint,
   rows = 4,
   maxLength,
+  autoResize = false,
+  actions,
+  disabled,
 }: {
   label: string
   value: string
@@ -176,17 +188,32 @@ export function TextArea({
   hint?: string
   rows?: number
   maxLength?: number
+  /** Grow and shrink with the text instead of scrolling inside the box. */
+  autoResize?: boolean
+  actions?: ReactNode
+  disabled?: boolean
 }) {
   const counter = maxLength ? `${value.length}/${maxLength}` : undefined
   const displayHint = hint && counter ? `${hint} · ${counter}` : hint || counter
+  const box = useRef<HTMLTextAreaElement>(null)
+  // measured before the browser paints, so the box is the right height on every keystroke and on first show
+  useLayoutEffect(() => {
+    const el = box.current
+    if (!autoResize || !el) return
+    el.style.height = 'auto'
+    el.style.height = `${el.scrollHeight + 2}px`
+  }, [value, autoResize])
   return (
-    <Field label={label} hint={displayHint}>
+    <Field label={label} hint={displayHint} actions={actions}>
       {(id) => (
         <textarea
           id={id}
+          ref={box}
           rows={rows}
           value={value}
           maxLength={maxLength}
+          disabled={disabled}
+          style={autoResize ? { overflow: 'hidden', resize: 'none' } : undefined}
           onChange={(e) => onChange(e.target.value)}
         />
       )}

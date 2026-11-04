@@ -69,3 +69,61 @@ describe('draftChanges', () => {
     expect(draftChanges(DRAFT, edited)).toEqual({})
   })
 })
+
+// ---- skills: only skills the profile already has can be highlighted ------------------------------------------------
+
+import { findProfileSkill, matchingProfileSkills, profileSkillList, recommendSkills, sameSkills, skillKey } from './lib.ts'
+
+const PROFILE_SKILLS = {
+  skills: ['OOP', 'Python, JavaScript', 'React Native'],
+  programming_languages: ['Python', 'TypeScript'],
+  frameworks: ['React.js', 'Next.js'],
+  databases_tools: ['PostgreSQL', 'postgresql', 'Docker'],
+}
+
+describe('skill helpers', () => {
+  it('treats spelling variants as one skill', () => {
+    expect(skillKey('React Native')).toBe(skillKey('react-native'))
+    expect(skillKey('C++')).toBe('c++')
+    expect(skillKey('C#')).not.toBe(skillKey('C'))
+    expect(skillKey('  ')).toBe('')
+  })
+
+  it('lists every profile skill once, splitting comma-joined entries; tools and languages before general skills', () => {
+    expect(profileSkillList(PROFILE_SKILLS)).toEqual(['Python', 'TypeScript', 'React.js', 'Next.js', 'PostgreSQL', 'Docker', 'OOP', 'JavaScript', 'React Native'])
+    expect(profileSkillList(null)).toEqual([])
+    expect(profileSkillList({ skills: [], programming_languages: [], frameworks: [], databases_tools: [] })).toEqual([])
+  })
+
+  it("finds the profile's own spelling, and nothing the profile does not have", () => {
+    const list = profileSkillList(PROFILE_SKILLS)
+    expect(findProfileSkill('react native', list)).toBe('React Native')
+    expect(findProfileSkill('REACT-NATIVE', list)).toBe('React Native')
+    expect(findProfileSkill('Kubernetes', list)).toBeNull()
+    expect(findProfileSkill('', list)).toBeNull()
+    expect(findProfileSkill('React', list)).toBeNull() // a part of a skill is not the skill
+  })
+
+  it('offers matching profile skills that are not highlighted yet, prefix matches first', () => {
+    const list = profileSkillList(PROFILE_SKILLS)
+    expect(matchingProfileSkills('re', list, [])).toEqual(['React.js', 'React Native', 'PostgreSQL']) // prefix matches first, then "contains"
+    expect(matchingProfileSkills('script', list, [])).toEqual(['TypeScript', 'JavaScript'])
+    expect(matchingProfileSkills('re', list, ['React Native'])).toEqual(['React.js', 'PostgreSQL'])
+    expect(matchingProfileSkills('zzz', list, [])).toEqual([])
+    expect(matchingProfileSkills('', list, [])).toEqual([])
+    expect(matchingProfileSkills('a', list, [], 2)).toHaveLength(2)
+  })
+
+  it('recommends unhighlighted profile skills, bringing back what the AI had suggested first', () => {
+    const list = profileSkillList(PROFILE_SKILLS)
+    expect(recommendSkills(list, ['Python'], ['Docker', 'Python'], 3)).toEqual(['Docker', 'TypeScript', 'React.js'])
+    expect(recommendSkills(list, list, [])).toEqual([])
+    expect(recommendSkills(list, [], [], 2)).toEqual(['Python', 'TypeScript'])
+  })
+
+  it('compares skill lists by order and spelling-insensitive value', () => {
+    expect(sameSkills(['React Native', 'Go'], ['react-native', 'go'])).toBe(true)
+    expect(sameSkills(['Go', 'Rust'], ['Rust', 'Go'])).toBe(false)
+    expect(sameSkills(['Go'], [])).toBe(false)
+  })
+})

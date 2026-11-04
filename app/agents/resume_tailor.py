@@ -6,6 +6,7 @@ from typing import Annotated
 
 from langchain_ollama import ChatOllama
 
+from app.agents import positioning
 from app.services.llm_fallback import FallbackChat
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -169,92 +170,73 @@ tailor_agent = FallbackChat(ChatOllama(
 
 
 class _Prose(BaseModel):
-    """Both fields are required, so an empty `{}` is not a valid answer."""
+    """The model writes only the summary; the headline is built by rules (see positioning.py)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    headline: Annotated[str, Field(min_length=3, max_length=120)]
     summary: Annotated[str, Field(min_length=30, max_length=350)]
 
 
 PROSE_PROMPT = """
-You write the headline and summary of a resume, tailored to a job. Use ONLY the facts you are given.
+You write the professional summary of a resume, tailored to a job. Use ONLY the facts you are given.
 
 - Write as the resume's owner: no "I", no "my", no "the candidate".
 - The target job's title is NOT the candidate's title. Never use it as the candidate's own title.
-- headline: the candidate's most recent role (as given in the facts), then " | ", then two or three
-  of the listed skills. At most 12 words.
-- summary: two sentences, at most 60 words, built from the facts.
+- Two sentences, at most 60 words. Lead with who the candidate is (their real role and experience), then the one
+  or two things from the facts that matter most for this job, with the skills that match it.
 - Do not mention any skill, tool, employer, number or achievement that is not in the facts.
-- Do not copy a fact word for word; write it naturally.
-Return a JSON object with exactly the keys "headline" and "summary".
+- Do not copy a fact word for word, and do not repeat the same skill or idea twice.
+Return a JSON object with exactly the key "summary".
 """
 
 _FIRST_PERSON = re.compile(r"\b(?:I|my|me|myself)\b")
 
 
 def _verify_prose(prose: _Prose, facts: dict) -> None:
-    """Accept the model's text only if everything in it is supported by the resume. Raises ValueError."""
+    """Accept the model's summary only if everything in it is supported by the resume. Raises ValueError."""
     known, jd_terms = facts["known"], facts["jd_terms"]
     candidate_text = facts["candidate_text"]
-    for field, text in (("headline", prose.headline.strip()), ("summary", prose.summary.strip())):
-        words = text.split()
-        if _JUNK.search(text) or _THIRD_PERSON.search(text) or _FIRST_PERSON.search(text):
-            raise ValueError(f"{field} has stray quotes/JSON, or is not written as the resume's owner")
-        if not text[0].isalpha() or not any(c.isalpha() for c in text):
-            raise ValueError(f"{field} is not meaningful text")
-        lowered = [w.lower().strip(".,;:()|") for w in words]
-        trigrams = [tuple(lowered[i : i + 3]) for i in range(len(lowered) - 2)]
-        if len(set(lowered)) / len(words) < 0.6 or len(trigrams) != len(set(trigrams)):
-            raise ValueError(f"{field} is repetitive")
-        unsupported = []
-        for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9.+#_-]*", text):
-            stem = _tokens(word)[0]
-            if stem not in known and (stem in jd_terms or _TECHNICAL.search(word.strip("."))):
-                unsupported.append(word)
-        unsupported += [n for n in re.findall(r"\d+(?:[.,]\d+)?", text) if n not in set(re.findall(r"\d+(?:[.,]\d+)?", candidate_text))]
-        if unsupported:
-            raise ValueError(f"{field} mentions things not in the resume: {', '.join(dict.fromkeys(unsupported[:5]))}")
+    text = prose.summary.strip()
+    words = text.split()
+    if _JUNK.search(text) or _THIRD_PERSON.search(text) or _FIRST_PERSON.search(text):
+        raise ValueError("summary has stray quotes/JSON, or is not written as the resume's owner")
+    if not text[0].isalpha() or not any(c.isalpha() for c in text):
+        raise ValueError("summary is not meaningful text")
+    lowered = [w.lower().strip(".,;:()|") for w in words]
+    trigrams = [tuple(lowered[i : i + 3]) for i in range(len(lowered) - 2)]
+    if len(set(lowered)) / len(words) < 0.6 or len(trigrams) != len(set(trigrams)):
+        raise ValueError("summary is repetitive")
+    unsupported = []
+    for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9.+#_-]*", text):
+        stem = _tokens(word)[0]
+        if stem not in known and (stem in jd_terms or _TECHNICAL.search(word.strip("."))):
+            unsupported.append(word)
+    unsupported += [n for n in re.findall(r"\d+(?:[.,]\d+)?", text) if n not in set(re.findall(r"\d+(?:[.,]\d+)?", candidate_text))]
+    if unsupported:
+        raise ValueError(f"summary mentions things not in the resume: {', '.join(dict.fromkeys(unsupported[:5]))}")
 
-    headline_words, summary_words = prose.headline.split(), prose.summary.split()
-    if not 2 <= len(headline_words) <= 15:
-        raise ValueError("headline is not a short title line")
-    if not 8 <= len(summary_words) <= 70 or not prose.summary.strip().endswith((".", "!")):
+    if not 8 <= len(words) <= 70 or not text.endswith((".", "!")):
         raise ValueError("summary is not 2 short sentences")
-    if "|" in prose.summary:
+    if "|" in text:
         raise ValueError("summary looks like a pasted resume header")
 
-    squash = lambda text: re.sub(r"\W+", "", text.lower())
+    squash = lambda value: re.sub(r"\W+", "", value.lower())
     candidate_sq = squash(candidate_text)
 
     # Never claim the job's own title: words such as "backend" or "engineer" can appear elsewhere in
     # the resume, so check the whole phrase.
     role = squash(facts["role"])
-    if role and any(role in squash(text) and role not in candidate_sq for text in (prose.headline, prose.summary)):
+    if role and role in squash(text) and role not in candidate_sq:
         raise ValueError(f"claims the job's title ({facts['role']}), which the candidate has not held")
 
-    # The part of the headline before "|" or "at" must be a real job title (dropping "Junior" is fine,
-    # adding words is not), or just a list of the candidate's own matching skills.
-    lead = re.split(r"\||\bat\b", prose.headline, maxsplit=1)[0].strip(" ,")
-    titles = [squash(t) for t in facts["titles"]]
-    skill_items = [squash(i) for i in re.split(r"[,;]", lead) if i.strip()]
-    allowed_skills = {squash(sk) for sk in facts["skills"]}
-    if titles and not (
-        any(squash(lead) in t for t in titles) or (skill_items and all(i in allowed_skills for i in skill_items))
-    ):
-        raise ValueError(f"headline title '{lead}' is not one of the candidate's real job titles")
-
     # Pasting resume sentences one after another is not a rewrite.
-    sentences = [x for x in re.split(r"(?<=[.!?])\s+", prose.summary.strip()) if len(squash(x)) >= 12]
+    sentences = [x for x in re.split(r"(?<=[.!?])\s+", text) if len(squash(x)) >= 12]
     if sentences and all(squash(x) in candidate_sq for x in sentences):
         raise ValueError("summary is copied from the resume instead of written for this job")
-    mentioned = set(_tokens(prose.headline + " " + prose.summary)) & facts["anchor_terms"]
-    if len(mentioned) < 2:
-        raise ValueError("text does not mention the candidate's real role, employer or matching skills")
 
 
 def _llm_prose(job_description: str, facts: dict) -> _Prose | None:
-    """One attempt to have the model write the headline and summary from verified facts. Returns None
+    """One attempt to have the model write the summary from verified facts. Returns None
     (and logs why) if the model is unavailable or its text is not fully supported by the resume."""
     if os.getenv("TAILOR_USE_LLM", "1") == "0":
         return None  # model step switched off: keep the rule-based text
@@ -263,6 +245,8 @@ def _llm_prose(job_description: str, facts: dict) -> _Prose | None:
     lines = [f"The job being applied for (NOT the candidate's title): {facts['role']}"]
     if facts["title"]:
         lines.append(f"Most recent role: {facts['title']}" + (f" at {facts['company']}" if facts["company"] else ""))
+    if facts.get("profile_summary"):
+        lines.append(f"The candidate's own summary: {facts['profile_summary']}")
     if facts["skills"]:
         lines.append(f"Skills you may mention (they match the job): {', '.join(facts['skills'])}")
     if facts["bullets"]:
@@ -276,11 +260,11 @@ def _llm_prose(job_description: str, facts: dict) -> _Prose | None:
         _verify_prose(prose, facts)
         return prose
     except Exception as exc:  # model missing/down, aborted, invalid JSON, or text that failed verification
-        logger.warning("Model-written headline/summary not used (rule-based text kept): %s", str(exc).splitlines()[0][:200])
+        logger.warning("Model-written summary not used (rule-based text kept): %s", str(exc).splitlines()[0][:200])
         return None
 
 
-def _build_draft(profile: dict,job_description: str,evidence: str)-> tuple[TailoredResumeDraft,dict]:
+def _build_draft(profile: dict,job_description: str,evidence: str, *, variant: int = 0, target_title: str | None = None)-> tuple[TailoredResumeDraft,dict]:
     jd_terms = set(_terms(job_description)) - _ROLE_STEMS
     jd_words = {}
 
@@ -422,38 +406,23 @@ def _build_draft(profile: dict,job_description: str,evidence: str)-> tuple[Tailo
         reverse=True,
     )
 
-    # Headline uses the candidate's real most recent title.
     title, company = next(
         ((title, company) for title, company in roles if title),
         (None, None),
     )
 
-    headline_skills = matched_skills[:3]
-
-    headline = " | ".join(
-        part for part in (
-            title,
-            ", ".join(headline_skills),
-        )
-        if part
-    ) or None
-
-    # Build a conservative summary from actual profile facts.
-    summary_parts = []
-
-    if title and company:
-        summary_parts.append(f"{title} at {company}")
-
-    if matched_skills:
-        summary_parts.append(
-            "Skilled in " + ", ".join(matched_skills[:5])
-        )
-
-    summary = (
-        ". ".join(summary_parts).rstrip(".") + "."
-        if summary_parts
-        else _shorten(_as_text(profile.get("summary")), 350) or None
-    )
+    # Headline and summary (see positioning.py): role-specific, built from the resume's own words. The role named
+    # in the headline is the job's, but only when the resume evidences it; otherwise the candidate's real title.
+    profile_blob = json.dumps(profile, default=str)
+    job_role = positioning.target_role(job_description, target_title)   # (not `job_title`: the loop above uses that name)
+    headline_role = positioning.supported_role(job_role, profile_blob)
+    headline = positioning.build_headline(
+        headline_role, title, matched_skills, positioning._years_phrase(_as_text(profile.get("summary"))), variant)
+    summary = positioning.build_summary(
+        profile_summary=_as_text(profile.get("summary")), title=title, company=company, skills=matched_skills,
+        accomplishments=positioning.accomplishment_lines([item for _, item in experience_items], relevance),
+        project_lines=positioning.project_lines([item for _, item in project_items], relevance), variant=variant,
+    ) or _shorten(_as_text(profile.get("summary")), 350) or None
 
     # Missing technical terms remain suggestions, never candidate skills.
     known = set(_tokens(
@@ -530,7 +499,9 @@ def _build_draft(profile: dict,job_description: str,evidence: str)-> tuple[Tailo
             if item.bullets and relevance(item.bullets[0])
         ],
         "titles": [t for t, _ in roles if t],
-        "role": re.split(r"[.\n]", job_description.strip(), maxsplit=1)[0][:80],
+        "role": job_role or re.split(r"[.\n]", job_description.strip(), maxsplit=1)[0][:80],
+        "matched_skills": matched_skills,
+        "profile_summary": _shorten(_as_text(profile.get("summary")), 300),
         "known": known,
         "jd_terms": set(_terms(job_description)),
         "candidate_text": f"{json.dumps(profile, default=str)}\n{evidence}".replace("/n", "\n"),
@@ -544,6 +515,7 @@ def tailor_resume(
     profile_id: str,
     profile: dict,
     job_description: str,
+    job_title: str | None = None,
 ) -> dict:
     """Generate one reviewable, evidence-grounded resume tailoring draft."""
 
@@ -579,12 +551,12 @@ def tailor_resume(
         profile,
         job_description,
         evidence,
+        target_title=job_title,
     )
 
     prose = _llm_prose(job_description, facts)
 
     if prose:
-        draft.headline = prose.headline.strip()
         draft.summary = prose.summary.strip()
 
     return {
@@ -599,3 +571,20 @@ def tailor_resume(
             for doc in documents
         ],
     }
+
+
+SUGGESTABLE_FIELDS = ("headline", "summary", "skills")
+
+
+def suggest_field(profile: dict, job_description: str, field: str, variant: int = 0, job_title: str | None = None):
+    """A fresh suggestion for one field of the positioning section: the headline or summary as text, the
+    skills to highlight as a list. Built by rules from the profile and the job; nothing is stored here.
+    Different `variant`s give different, equally grounded wording."""
+    if field not in SUGGESTABLE_FIELDS:
+        raise ValueError(f"field must be one of: {', '.join(SUGGESTABLE_FIELDS)}")
+    if not (job_description or "").strip():
+        raise ValueError("Job description must not be empty.")
+    draft, facts = _build_draft(profile, job_description, "", variant=variant, target_title=job_title)
+    if field == "skills":
+        return list(facts["matched_skills"])[:12]        # only skills the profile already has
+    return getattr(draft, field)

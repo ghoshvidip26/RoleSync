@@ -7,6 +7,16 @@ export interface FitResult {
   review: ReviewResult | null
 }
 
+/** What the AI last suggested for the positioning fields of one draft, so edits can be told apart from suggestions
+ * (and survive leaving the page). `variants` counts how many times each field was regenerated. */
+export interface PositioningBaseline {
+  draftId: string
+  headline: string
+  summary: string
+  skills: string[]
+  variants: { headline: number; summary: number; skills: number }
+}
+
 export interface FlowState {
   step: StepId
   profile: Profile | null
@@ -14,6 +24,7 @@ export interface FlowState {
   job: Job
   fit: FitResult | null
   draft: DraftRecord | null
+  positioning: PositioningBaseline | null
   template: string | null // a gallery id, "original", or null (not chosen yet)
   emailId: string | null
 }
@@ -23,7 +34,7 @@ export const STEP_IDS = ['upload', 'job', 'fit', 'draft', 'design', 'email'] as 
 export type StepId = (typeof STEP_IDS)[number]
 
 export const EMPTY_FLOW: FlowState = {
-  step: 'upload', profile: null, assessment: null, job: EMPTY_JOB, fit: null, draft: null, template: null, emailId: null,
+  step: 'upload', profile: null, assessment: null, job: EMPTY_JOB, fit: null, draft: null, positioning: null, template: null, emailId: null,
 }
 
 export const FLOW_KEY = 'founders-outreach-flow-v1'
