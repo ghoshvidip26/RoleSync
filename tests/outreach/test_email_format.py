@@ -140,11 +140,11 @@ def test_a_long_bullet_is_cut_at_a_clause_not_mid_phrase():
 def test_a_verified_model_email_supplies_the_two_paragraphs_and_code_the_rest():
     result = run(MIDDLE, subject="Backend work with Redis at PayLoop")
     parts = blocks(result.body)
+    assert result.source == "model"
     assert parts[0] == "Hi Miles," and parts[1].startswith("I'm Sarah, a Backend Engineer who most recently")
     assert parts[2].startswith("I work with Python, PostgreSQL and Redis")
-    assert result.subject == "Backend work with Redis at PayLoop"
+    assert result.subject == "Exploring Backend Engineer Opportunities at Cyberdyne Systems"   # rule-based: the model's subject is not used
     assert result.body.count(oa.CLOSING_REGARDS) == 1
-
 
 def test_a_greeting_or_sign_off_the_model_adds_is_dropped_not_doubled():
     wrapped = "Hi Miles,\n\n" + MIDDLE + "\n\nThanks & Regards,\nSarah Connor"
@@ -167,12 +167,11 @@ def test_an_unverifiable_model_email_falls_back_to_the_template_paragraphs():
     assert "TensorFlow" not in body and "I work mainly with" in body
 
 
-def test_a_long_model_subject_is_replaced_by_a_short_one():
-    result = run("", subject="x" * 5)                                      # template path
-    assert result.subject == "Sarah Connor: Backend Engineer interested in Cyberdyne Systems"
-    long = run(MIDDLE, subject="A very long subject line about backend work with Redis at PayLoop that nobody would read in an inbox")
-    assert long.subject == "Sarah Connor: Backend Engineer interested in Cyberdyne Systems"
-
+def test_the_subject_is_rule_based_whatever_the_model_writes():
+    expected = "Exploring Backend Engineer Opportunities at Cyberdyne Systems"
+    assert run("", subject="x" * 5).subject == expected
+    assert run(MIDDLE, subject="A very long subject line about backend work with Redis at PayLoop that nobody would read in an inbox").subject == expected
+    assert run(MIDDLE, subject="Great news!!! Click now").subject == expected
 
 def test_links_sit_directly_under_the_signature():
     body = run(MIDDLE).body
@@ -181,12 +180,12 @@ def test_links_sit_directly_under_the_signature():
 
 # -------------------------------------------------------------------- personal note
 
-def test_a_personal_note_is_used_as_written_at_the_start_of_the_intro():
+def test_the_personal_line_is_its_own_paragraph_after_the_achievements_and_before_the_call_to_action():
     note = "I've been following Cyberdyne's work on autonomous systems."
-    body = run("", note=note).body
-    assert blocks(body)[1].startswith(note + " I'm Sarah.")
+    parts = blocks(run("", note=note).body)
+    i = parts.index(note)
+    assert parts[i - 1].startswith(oa.PROOF_HEADING) and "look forward" in parts[i + 1]
     assert note not in run("").body
-
 
 # --------------------------------------------------------------------- questions
 
@@ -196,14 +195,14 @@ RICH = {**TAILORED, "experience": [
     {"company": "Beta", "job_title": "Engineer", "bullets": ["Wrote a deployment tool in Python that removed manual release steps for four teams."]}]}
 
 
-def test_a_question_gets_an_answer_and_its_own_proof():
+def test_a_question_given_to_run_is_answered_concisely_in_its_own_block_without_extra_bullets():
     parts = blocks(run("", tailored=RICH, questions=["Why should you choose me?"]).body)
     i = next(n for n, b in enumerate(parts) if b.startswith("Why should you choose me?"))
-    assert parts[i].splitlines()[1].startswith("I'm Sarah, a Backend Engineer with hands-on experience in")
-    assert i > next(n for n, b in enumerate(parts) if b.startswith(oa.PROOF_HEADING))      # after the main proof
-    assert i < next(n for n, b in enumerate(parts) if "look forward" in b)                  # before the closing
-    assert parts[i + 1].startswith(oa.PROOF_HEADING) and "• " in parts[i + 1]               # its own, different bullets
-
+    answer = parts[i].splitlines()[1]
+    assert answer.startswith("I'm Sarah, a Backend Engineer with hands-on experience in") and len(answer.split()) <= oa.ANSWER_MAX_WORDS
+    assert i > next(n for n, b in enumerate(parts) if b.startswith(oa.PROOF_HEADING))      # after the main achievements
+    assert i < next(n for n, b in enumerate(parts) if "look forward" in b)                  # before the call to action
+    assert oa.PROOF_HEADING not in parts[i] and "•" not in parts[i]
 
 def test_a_sparse_profile_gets_an_answer_without_repeating_proof():
     body = run("", questions=["Why should you choose me?"]).body
@@ -270,14 +269,13 @@ def test_invalid_questions_or_notes_are_refused(bad):
 
 # ----------------------------------------------------------------- richer skills, no repeated proof
 
-def test_the_expertise_paragraph_names_up_to_six_real_skills_tailored_ones_first():
+def test_the_expertise_paragraph_names_real_skills_tailored_ones_first_and_at_most_six():
     profile = PROFILE.model_copy(update={
         "programming_languages": ["Python", "Go", "TypeScript", "SQL"], "frameworks": ["FastAPI", "React"],
         "databases_tools": ["PostgreSQL", "Redis", "Docker"], "skills": ["OOP, Data Structures"]})
     skills = oa._expertise_skills(profile, {"skills": ["Redis", "Go"]})
     assert skills == ["Redis", "Go", "Python", "TypeScript", "SQL", "FastAPI"] and "OOP" not in skills
-    assert "I work mainly with Redis, Go, Python, TypeScript, SQL and FastAPI." in oa._template_email(profile, COMPANY, RECIPIENT, {"skills": ["Redis", "Go"]}).body
-
+    assert oa._template_paragraphs(profile, {"skills": ["Redis", "Go"]}, skills_n=5)[1] == "I work mainly with Redis, Go, Python, TypeScript and SQL."
 
 def test_concepts_are_used_only_when_there_are_too_few_tools():
     assert oa._expertise_skills(PROFILE, None) == ["Python", "Kubernetes", "PostgreSQL", "Redis"]
@@ -382,10 +380,9 @@ def test_the_personal_line_is_tidied_but_otherwise_left_as_written(raw, tidy):
     assert oa._tidy_note(raw) == tidy
 
 
-def test_the_personal_line_does_not_run_into_the_intro():
+def test_the_personal_line_is_tidied_and_stands_on_its_own():
     body = run("", note="I'm looking for SWE-1/").body
-    assert "I'm looking for SWE-1. I'm Sarah" in body and "SWE-1/" not in body
-
+    assert "\n\nI'm looking for SWE-1.\n\n" in body and "SWE-1/" not in body
 
 def test_a_cut_never_leaves_a_parenthesis_open():
     bullet = ("Delivered 6 rider order flows (pickup, delivery, returns, replacements, cancellations, cash collection) via REST APIs, "
@@ -405,12 +402,11 @@ def test_cuts_outside_brackets_are_unchanged():
 
 def test_a_job_that_is_still_going_on_is_introduced_as_current():
     now = PROFILE.model_copy(update={"experience": ["Backend Engineer | PayLoop, Pune\nJun 2020 – Present\n• Cut latency 45%."]})
-    assert "I'm Sarah, currently a Backend Engineer at PayLoop." in run("", profile=now).body
+    assert "I'm Sarah, currently working as a Backend Engineer at PayLoop." in run("", profile=now).body
     for ongoing in ("Jun 2020 - present", "2020 – Current", "since 2020 (now)"):
         profile = PROFILE.model_copy(update={"experience": [f"Backend Engineer | PayLoop, Pune\n{ongoing}\n• Cut latency 45%."]})
         assert oa._current_role_with_dates(profile)[2] is True or "since" in ongoing        # "since 2020 (now)" is not a date line
     assert "I'm Sarah. Most recently I've worked as a Backend Engineer at PayLoop." in run("").body   # ended: as before
-
 
 def test_a_recipient_named_hi_gets_a_team_greeting_in_the_whole_email():
     body = run("", recipient=_recipient("Hi")).body
@@ -511,11 +507,11 @@ def test_the_resume_summary_becomes_a_first_person_sentence_only_when_it_has_tha
     assert oa._summary_sentence(MIXED.model_copy(update={"summary": summary})) == sentence
 
 
-def test_the_intro_reuses_the_resume_summary():
+def test_the_intro_uses_the_resumes_own_field_years_and_activity():
     paragraphs = oa._template_paragraphs(MIXED, None)
-    assert paragraphs[0] == ("I'm Vidip, currently a Junior Mobile Application Developer at Aforro. "
-                             "I have 1 year of experience shipping mobile, backend, and AI features in TypeScript, Python, and React Native.")
-
+    assert paragraphs[0] == ("I'm Vidip, a software engineer with 1 year of professional experience, currently working as a Junior Mobile "
+                             "Application Developer at Aforro. I've been shipping mobile, backend, and AI features in TypeScript, Python, and React Native.")
+    assert "recent graduate" not in paragraphs[0].lower()
 
 def test_company_terms_include_the_domain_and_expand_known_fields():
     terms = oa._wanted_terms(Company(id="c", name="Gnani", website="https://www.gnani.ai"), RECIPIENT, None, None)
@@ -530,3 +526,23 @@ def test_a_long_sentence_is_cut_before_a_clause_word_not_in_the_middle_of_a_clau
     cut = oa._clause_cut("Built a payments service that handles refunds and settlements for forty merchants across three countries", 70)
     assert cut == "Built a payments service that handles refunds and settlements"         # before " for ", a whole clause dropped
     assert oa._clause_cut("Short one", 50) == "Short one"
+
+
+# ------------------------------------------------------------------ the job decides which skills and achievements lead
+
+def test_skills_and_achievements_follow_the_job_description_using_only_the_candidates_own_skills():
+    jd = "We need strong Redis and Docker skills, plus Kubernetes and Terraform experience."
+    profile = PROFILE.model_copy(update={"programming_languages": ["Python", "Go"], "frameworks": [], "databases_tools": ["PostgreSQL", "Redis", "Docker"]})
+    skills = oa._expertise_skills(profile, None, 3, jd)
+    assert skills[:2] == ["Redis", "Docker"] and "Kubernetes" not in skills and "Terraform" not in skills     # job words the candidate lacks never appear
+    assert oa._expertise_skills(profile, None, 3) == ["Python", "Go", "PostgreSQL"]                           # without a job: profile order
+    email = oa._template_email(profile, COMPANY, RECIPIENT, None, role="Platform Engineer", job_text=jd)
+    assert "I work mainly with Redis, Docker" in email.body and "Kubernetes" not in email.body and "Terraform" not in email.body
+
+
+def test_when_the_model_cannot_even_be_created_the_grounded_email_is_still_written():
+    with patch.object(oa, "get_retriever", return_value=None), \
+         patch.object(oa, "get_llm", side_effect=RuntimeError("no model, no key")):
+        result = OutreachAgent().run(PROFILE, COMPANY, RECIPIENT, tailored=TAILORED, questions=["Why should you choose me?"])
+    assert result.source == "template" and result.body.startswith("Hi Miles,") and "Sarah Connor" in result.body
+    assert result.subject and "{" not in result.body

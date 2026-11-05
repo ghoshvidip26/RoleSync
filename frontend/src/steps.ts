@@ -31,6 +31,6 @@ export function lockReason(step: StepId, flow: FlowState): string | null {
     case 'fit': case 'draft':
       return !flow.profile ? 'Upload and confirm your resume first' : !hasJob ? 'Paste the job description first' : null
     case 'design': return approved ? null : 'Approve your tailored resume first'
-    case 'email': return !approved ? 'Approve your tailored resume first' : !flow.template ? 'Choose a design first' : null
+    case 'email': return flow.profile ? null : 'Upload and confirm your resume first'   // drafting works without an approved resume; sending is warned about there
   }
 }

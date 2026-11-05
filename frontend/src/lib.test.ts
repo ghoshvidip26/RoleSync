@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { cleanProfile, clock, draftChanges, looksLikeEmail, parseLines, parseTags, PLACEHOLDER_EMAIL, profileProblems, sameList } from './lib.ts'
+import { bodyWords, explainUnclear, cleanProfile, extractQuestions, clock, draftChanges, looksLikeEmail, parseLines, parseTags, PLACEHOLDER_EMAIL, profileProblems, sameList } from './lib.ts'
 import type { ProfileData, ResumeDraft } from './types.ts'
 
 describe('parseTags', () => {
@@ -125,5 +125,58 @@ describe('skill helpers', () => {
     expect(sameSkills(['React Native', 'Go'], ['react-native', 'go'])).toBe(true)
     expect(sameSkills(['Go', 'Rust'], ['Rust', 'Go'])).toBe(false)
     expect(sameSkills(['Go'], [])).toBe(false)
+  })
+})
+
+describe('extractQuestions / bodyWords', () => {
+  it('finds the questions a posting asks, once each, cleaned', () => {
+    const jd = 'We build things.\n- Why do you want to work here?\n2) Why do you want to work here?\nTell us. What is your proudest project? Thanks.'
+    expect(extractQuestions(jd)).toEqual(['Why do you want to work here?', 'What is your proudest project?'])
+    expect(extractQuestions('')).toEqual([])
+  })
+  it('counts the body words before the sign-off only', () => {
+    expect(bodyWords('Hi Sam,\n\nOne two three.\n\nThanks & Regards,\nAlex Doe')).toBe(5)
+    expect(bodyWords('No sign off here')).toBe(4)
+    expect(bodyWords('Proof:\n• one two\n• three')).toBe(4)          // the • markers are not words
+  })
+})
+
+describe('explainUnclear', () => {
+  it('says which words the resume mentions and which it does not, without filler words', () => {
+    const u = explainUnclear('Build scalable and secure REST and GraphQL APIs — only partly shown (found: secure, rest, apis; not found: scalable, graphql)')
+    expect(u.requirement).toBe('Build scalable and secure REST and GraphQL APIs')
+    expect(u.found).toEqual(['secure', 'rest', 'apis'])
+    expect(u.missing).toEqual(['scalable', 'graphql'])
+    expect(u.kind).toBe('skill')
+    expect(u.note).toMatch(/If you have really used them/)
+  })
+  it('drops grammar and generic duty words from the lists', () => {
+    const u = explainUnclear('Design evaluation framework and carry out evaluations of our query processing engine. — only partly shown (found: evaluations, framework, engine; not found: carry, out, query, processing)')
+    expect(u.missing).toEqual(['query', 'processing'])
+    expect(u.requirement.endsWith('.')).toBe(false)
+  })
+  it('treats a duty with no named tool as work, not as a skill to prove', () => {
+    const u = explainUnclear('Shape up the engineering culture and tech stack for the company. — only partly shown (found: engineering; not found: shape, up, culture, tech, stack, company)')
+    expect(u.kind).toBe('work')
+    expect(u.note).toMatch(/describes the work itself/)
+  })
+  it('explains words that appear but never together', () => {
+    const u = explainUnclear('Collaborate with frontend developers to integrate APIs — only partly shown (found: frontend, integrate, apis; but never together in one place)')
+    expect(u.note).toMatch(/never together in one place/)
+    expect(u.missing).toEqual([])
+  })
+  it('shows the closest line of the resume for related evidence', () => {
+    const u = explainUnclear('Design and optimize PostgreSQL database schemas — related evidence exists (SDE Intern at TechKareer: Optimized PostgreSQL schemas) but it does not clearly meet the requirement')
+    expect(u.closest).toBe('SDE Intern at TechKareer: Optimized PostgreSQL schemas')
+    expect(u.note).toMatch(/related work/)
+  })
+  it('explains an experience-amount requirement', () => {
+    const u = explainUnclear('2+ years of Python — relevant work is shown (Backend work at Acme), but the required amount of experience cannot be confirmed from the profile')
+    expect(u.closest).toBe('Backend work at Acme')
+    expect(u.note).toMatch(/amount of experience/)
+  })
+  it('never drops text in a format it does not know', () => {
+    expect(explainUnclear('Some requirement — brand new wording').note).toBe('brand new wording')
+    expect(explainUnclear('Just a requirement').requirement).toBe('Just a requirement')
   })
 })

@@ -71,7 +71,7 @@ def test_outreach_agent_draft_generation_with_links(sample_profile, sample_compa
         result = agent.run(sample_profile, sample_company, sample_recipient)
 
         assert isinstance(result, DraftEmail)
-        assert result.subject == "Distributed Systems at Cyberdyne"
+        assert result.subject == "Sarah Connor | Exploring Opportunities at Cyberdyne Systems"  # rule-based: the model's subject is not used
         assert "Sarah Connor" in result.body
         assert "https://github.com/sarahconnor" in result.body
         assert "https://sarahconnor.dev" in result.body
@@ -110,7 +110,7 @@ def test_outreach_agent_missing_optional_links(sample_company, sample_recipient)
 
         result = agent.run(profile_without_links, sample_company, sample_recipient)
 
-        assert result.subject == "Engineering at Cyberdyne"
+        assert result.subject == "John Doe | Exploring Opportunities at Cyberdyne Systems"   # rule-based
         assert "John Doe" in result.body
         assert "None" not in result.body
         assert "[Link]" not in result.body
@@ -141,7 +141,7 @@ def test_outreach_agent_fallback_parsing(sample_profile, sample_company, sample_
 
         result = agent.run(sample_profile, sample_company, sample_recipient)
 
-        assert result.subject == "Opportunities at Cyberdyne Systems"
+        assert result.subject == "Sarah Connor | Exploring Opportunities at Cyberdyne Systems"   # rule-based
         assert "Hi Miles" in result.body
         assert "Sarah Connor" in result.body
         assert "https://github.com/sarahconnor" in result.body
@@ -200,7 +200,8 @@ def test_approval_sends_email_via_smtp(sample_profile, sample_company, sample_re
 
     with patch("app.services.email_service.send_email") as mock_send, \
          patch("app.db.models.fetch") as mock_fetch, \
-         patch("app.db.models.update") as mock_update:
+         patch("app.db.models.update") as mock_update, \
+         patch("app.db.models.claim") as mock_claim:
 
         def mock_fetch_impl(table, id_):
             if table == "emails":
@@ -213,8 +214,9 @@ def test_approval_sends_email_via_smtp(sample_profile, sample_company, sample_re
 
         mock_fetch.side_effect = mock_fetch_impl
         mock_update.side_effect = lambda table, id_, data: {**email_row, **data}
+        mock_claim.side_effect = lambda table, id_, a, b, data=None: {**email_row, "status": b.value}
 
-        result = main.approve_and_send_email("email-app-1")
+        result = main.approve_and_send_email("email-app-1", send_without_attachment=True)
 
         assert result.status == EmailStatus.SENT
         mock_send.assert_called_once_with(

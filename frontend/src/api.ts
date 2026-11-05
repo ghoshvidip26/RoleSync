@@ -1,6 +1,7 @@
 import type {
   DraftRecord, EmailRecord, Gallery, OriginalAssessment, PdfResult, Profile, ProfileData, ResumeDraft,
-  ReviewResult, RoleRecommendation, TemplateInfo,
+  ReviewResult, TemplateInfo,
+  AnswerResult, AttachmentInfo, PersonalLineResult,
 } from './types.ts'
 
 /** Every request goes to /api (proxied to FastAPI by Vite). */
@@ -121,8 +122,6 @@ export const uploadOriginalResume = (profileId: string, file: File) =>
 
 // ---- job fit and tailoring --------------------------------------------------------------------------------------
 
-export const recommendRoles = (profileId: string) =>
-  json<{ recommendations: RoleRecommendation[] }>(`/profiles/${profileId}/recommend-roles`, { method: 'POST', timeoutMs: 60_000 })
 
 export const reviewFit = (profileId: string, jobDescription: string) =>
   json<ReviewResult>(`/profiles/${profileId}/review`, { ...post({ job_description: jobDescription }), timeoutMs: SLOW_MS })
@@ -175,12 +174,36 @@ export const createCompany = (name: string, website: string | null) =>
   json<{ id: string }>('/companies', post({ name, website }))
 export const createRecipient = (name: string | null, email: string, role: string | null) =>
   json<{ id: string }>('/recipients', post({ name, email, role }))
-export const createOutreach = (body: {
+export interface OutreachContext {
   profile_id: string; company_id: string; recipient_id: string; resume_draft_id: string | null
-  questions: string[]; personal_note: string | null
+  job_description?: string | null; job_title?: string | null
+}
+export const createOutreach = (body: OutreachContext & {
+  questions?: string[]; personal_note: string | null; answers?: Array<{ question: string; answer: string }>
 }) => json<EmailRecord>('/outreach', { ...post(body), timeoutMs: SLOW_MS })
+
+/** What the server asks the user to confirm before a send (409 + action): "confirm_no_attachment" or "confirm_retry". */
+export const actionOf = (err: unknown): string | null =>
+  err instanceof ApiError && err.body && typeof err.body === 'object' && 'action' in err.body ? String((err.body as { action: unknown }).action) : null
+
+export const suggestPersonalLine = (ctx: OutreachContext, variant: number) =>
+  json<PersonalLineResult>('/outreach/personal-line', { ...post({ ...ctx, variant }), timeoutMs: SLOW_MS })
+export const suggestAnswer = (ctx: OutreachContext, question: string, variant: number) =>
+  json<AnswerResult>('/outreach/answer', { ...post({ ...ctx, question, variant }), timeoutMs: SLOW_MS })
+export const regenerateEmailPart = (emailId: string, body: {
+  part: 'subject' | 'body'; variant: number; personal_note?: string | null
+  answers?: Array<{ question: string; answer: string }>; job_description?: string | null; job_title?: string | null
+}) => json<{ part: string; subject?: string; body?: string; words?: number; notes?: string[] }>(`/emails/${emailId}/regenerate`, { ...post(body), timeoutMs: SLOW_MS })
+export const emailAttachmentInfo = (emailId: string, template: string | null) =>
+  json<AttachmentInfo>(`/emails/${emailId}/attachment-info${withTemplate(template)}`, { timeoutMs: 120_000 })
 export const editEmail = (emailId: string, changes: { subject?: string; body?: string }) =>
   json<EmailRecord>(`/emails/${emailId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(changes) })
-export const sendEmail = (emailId: string, template: string | null) =>
-  json<EmailRecord>(`/emails/${emailId}/approve${withTemplate(template)}`, { method: 'POST', timeoutMs: 120_000 })
+export const sendEmail = (emailId: string, template: string | null, opts: { withoutAttachment?: boolean; confirmRetry?: boolean } = {}) => {
+  const params = new URLSearchParams()
+  if (template) params.set('template', template)
+  if (opts.withoutAttachment) params.set('send_without_attachment', 'true')
+  if (opts.confirmRetry) params.set('confirm_retry', 'true')
+  const query = params.toString()
+  return json<EmailRecord>(`/emails/${emailId}/approve${query ? `?${query}` : ''}`, { method: 'POST', timeoutMs: 120_000 })
+}
 export const rejectEmail = (emailId: string) => json<EmailRecord>(`/emails/${emailId}/reject`, { method: 'POST' })

@@ -294,3 +294,41 @@ def test_ordinary_edits_to_the_real_resume_still_give_a_valid_pdf_in_the_users_o
     verdict = validate_rendering(original, out, draft)
     failed = [(c["name"], c["detail"]) for c in verdict["checks"] if c["status"] == "fail"]
     assert verdict["passed"], (name, failed)
+
+
+# --------------------------------------------------- skill rows follow the job
+
+def design_skills():
+    p = Page(LETTER, left=40)
+    p.center("Alex Doe", 20)
+    p.heading("Technical Skills")
+    p.line("Languages: JavaScript, TypeScript, Python")
+    p.line("Backend: Node.js, Flask, Redis")
+    p.line("Frontend & Mobile: HTML, CSS, React Native, Next.js")
+    p.line("AI/ML: LLMs, RAG Pipelines, FAISS")
+    p.line("Tools: Git, Docker")
+    p.heading("Experience")
+    p.pair("Acme Corp", "Berlin", "hebo", right_font="hebo")
+    p.pair("Engineer", "Jan 2022 - Present", "heit", right_font="heit")
+    p.bullet("Built things")
+    return p.pdf()
+
+
+def test_the_skill_row_that_matches_the_job_moves_up_right_after_the_first_row():
+    pdf = design_skills()
+    draft = {"skills": ["JavaScript", "React Native", "HTML", "CSS", "Next.js", "Git"]}      # a frontend job
+    out, report = render(pdf, draft)
+    text = text_of(out)
+    order = [text.index(label) for label in ("Languages:", "Frontend & Mobile:", "Tools:", "Backend:", "AI/ML:")]
+    assert order == sorted(order)                                       # Languages, then Frontend, then Tools (Git), then the rest as before
+    assert pages_of(out) == pages_of(pdf) and report["pages"] == 1
+    for kept in ("Node.js", "Flask", "Redis", "LLMs", "RAG Pipelines", "FAISS", "Docker"):
+        assert kept in text                                             # no skill is dropped, only the order changes
+
+
+def test_the_first_row_stays_first_and_rows_keep_their_order_without_highlighted_skills():
+    pdf = design_skills()
+    out, _ = render(pdf, {"skills": []})
+    text = text_of(out)
+    order = [text.index(label) for label in ("Languages:", "Backend:", "Frontend & Mobile:", "AI/ML:", "Tools:")]
+    assert order == sorted(order)

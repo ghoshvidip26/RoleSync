@@ -8,10 +8,9 @@ import {
   Target,
   Wand2,
 } from 'lucide-react'
-import { recommendRoles, reviewFit } from '../api.ts'
+import { reviewFit } from '../api.ts'
 import { useFlow } from '../flow.tsx'
-import { errorText } from '../lib.ts'
-import type { RoleRecommendation } from '../types.ts'
+import { errorText, explainUnclear } from '../lib.ts'
 import { Badge, Collapsible, ErrorBanner, Notice, StepHeader, Working } from '../ui.tsx'
 
 const fitTone = (fit: string) =>
@@ -21,48 +20,32 @@ const fitTone = (fit: string) =>
     | 'bad'
 const label = (fit: string) => fit.replace(/_/g, ' ')
 
-function Roles({ roles }: { roles: RoleRecommendation[] }) {
+function UnclearCard({ item }: { item: ReturnType<typeof explainUnclear> }) {
   return (
-    <div className="cards">
-      {roles.slice(0, 4).map((r) => {
-        const pct = Math.round(r.score * 100)
-        return (
-          <article className="card" key={r.role_id}>
-            <div className="flex items-start justify-between gap-2">
-              <h4 className="m-0 text-white font-semibold">{r.title}</h4>
-              <Badge tone={fitTone(r.fit)}>{label(r.fit)}</Badge>
-            </div>
-
-            {/* Score progress bar */}
-            <div className="space-y-1 my-1">
-              <div className="flex justify-between text-xs">
-                <span className="muted">Match alignment</span>
-                <span className="font-mono font-medium text-indigo-400">{pct}%</span>
-              </div>
-              <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-indigo-500 to-sky-400 rounded-full"
-                  style={{ width: `${pct}%` }}
-                />
-              </div>
-            </div>
-
-            {r.matching.required.length > 0 && (
-              <p className="small text-slate-300">
-                <strong className="text-emerald-400">You have:</strong>{' '}
-                {[...r.matching.required, ...r.matching.preferred].join(', ')}
-              </p>
-            )}
-            {(r.gaps.required.length > 0 || r.gaps.preferred.length > 0) && (
-              <p className="small text-slate-300">
-                <strong className="text-amber-400">Missing:</strong>{' '}
-                {[...r.gaps.required, ...r.gaps.preferred].join(', ')}
-              </p>
-            )}
-          </article>
-        )
-      })}
-    </div>
+    <li className="rounded-lg border border-slate-800 bg-slate-950/40 p-3.5 space-y-1.5 list-none">
+      <div className="flex items-start gap-2">
+        <HelpCircle size={16} className="text-slate-400 shrink-0 mt-0.5" aria-hidden />
+        <div className="space-y-1.5 text-sm text-slate-300">
+          <p className="m-0 font-medium text-white">{item.requirement}</p>
+          <p className="m-0">{item.note}</p>
+          {item.found.length > 0 && (
+            <p className="m-0 small">
+              <strong className="text-emerald-400">Your resume mentions:</strong> {item.found.join(', ')}
+            </p>
+          )}
+          {item.missing.length > 0 && (
+            <p className="m-0 small">
+              <strong className="text-amber-400">Not mentioned:</strong> {item.missing.join(', ')}
+            </p>
+          )}
+          {item.closest && (
+            <p className="m-0 small">
+              <strong className="text-sky-300">Closest line in your resume:</strong> {item.closest}
+            </p>
+          )}
+        </div>
+      </div>
+    </li>
   )
 }
 
@@ -70,7 +53,6 @@ export function FitStep({ onNext }: { onNext: () => void }) {
   const { flow, update } = useFlow()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [rolesError, setRolesError] = useState<string | null>(null)
   const description = flow.job.description.trim()
   const fit = flow.fit && flow.fit.jobDescription === description ? flow.fit : null // results for another text are stale
 
@@ -78,17 +60,11 @@ export function FitStep({ onNext }: { onNext: () => void }) {
     if (!flow.profile) return
     setBusy(true)
     setError(null)
-    setRolesError(null)
-    const [roles, review] = await Promise.allSettled([
-      recommendRoles(flow.profile.id),
-      reviewFit(flow.profile.id, description),
-    ])
-    if (roles.status === 'rejected') setRolesError(errorText(roles.reason))
+    const [review] = await Promise.allSettled([reviewFit(flow.profile.id, description)])
     if (review.status === 'rejected') setError(errorText(review.reason))
     update({
       fit: {
         jobDescription: description,
-        roles: roles.status === 'fulfilled' ? roles.value.recommendations : null,
         review: review.status === 'fulfilled' ? review.value : null,
       },
     })
@@ -121,7 +97,6 @@ export function FitStep({ onNext }: { onNext: () => void }) {
       )}
 
       <ErrorBanner message={error} onRetry={run} />
-      <ErrorBanner message={rolesError} />
 
       {assessment && (
         <div className="space-y-5">
@@ -166,13 +141,14 @@ export function FitStep({ onNext }: { onNext: () => void }) {
             )}
 
             {assessment.uncertain_requirements.length > 0 && (
-              <Collapsible title="Unclear" count={assessment.uncertain_requirements.length}>
-                <ul className="space-y-2 mt-2">
-                  {assessment.uncertain_requirements.map((g, i) => (
-                    <li key={i} className="flex items-start gap-2 text-sm text-slate-300">
-                      <HelpCircle size={16} className="text-slate-400 shrink-0 mt-0.5" />
-                      <span>{g}</span>
-                    </li>
+              <Collapsible title="Partly shown (unclear)" count={assessment.uncertain_requirements.length} open>
+                <p className="muted small mt-2 mb-3">
+                  Your resume backs these up in part, but not clearly enough to count them as covered. This is not a verdict that you lack
+                  the skill: if you really have it, say so in your resume in your own words.
+                </p>
+                <ul className="space-y-3">
+                  {assessment.uncertain_requirements.map((raw, i) => (
+                    <UnclearCard key={i} item={explainUnclear(raw)} />
                   ))}
                 </ul>
               </Collapsible>
@@ -193,13 +169,6 @@ export function FitStep({ onNext }: { onNext: () => void }) {
               )}
             </Notice>
           )}
-        </div>
-      )}
-
-      {fit?.roles && fit.roles.length > 0 && (
-        <div className="space-y-3 pt-2">
-          <h3 className="text-base font-semibold text-white">Roles that suit your profile</h3>
-          <Roles roles={fit.roles} />
         </div>
       )}
 

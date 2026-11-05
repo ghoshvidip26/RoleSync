@@ -134,3 +134,90 @@ export function recommendSkills(list: string[], selected: string[], suggested: s
 /** Same skills in the same order, ignoring spelling differences. */
 export const sameSkills = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((s, i) => skillKey(s) === skillKey(b[i]))
+
+/** Questions a job posting asks the applicant: sentences or lines that end in "?" (3 to 200 characters), at most `limit`. */
+export function extractQuestions(text: string, limit = 4): string[] {
+  const found: string[] = []
+  for (const piece of (text || '').split(/(?<=[.!?])\s+|\n+/)) {
+    const q = piece.replace(/^[\s\-*•\d.)]+/, '').replace(/\s+/g, ' ').trim()
+    if (q.endsWith('?') && q.length >= 3 && q.length <= 200 && !found.some((x) => x.toLowerCase() === q.toLowerCase())) found.push(q)
+  }
+  return found.slice(0, limit)
+}
+
+/** Words of an e-mail body before its sign-off ("Thanks & Regards,"), which is not counted. */
+export function bodyWords(body: string): number {
+  const at = body.search(/^[ \t]*(?:thanks[ \t]*(?:&|and)[ \t]*regards|best regards|kind regards|warm regards|regards|sincerely|best|thanks|thank you|cheers)[ \t]*,?[ \t]*$/im)
+  return (at >= 0 ? body.slice(0, at) : body).split(/\s+/).filter((w) => w && w !== '•').length   // bullet markers are not words
+}
+
+/** One "Unclear" requirement from the fit check, in plain words. */
+export interface UnclearItem {
+  requirement: string
+  /** What the resume does show (words of the requirement it contains), without grammar filler. */
+  found: string[]
+  /** Words of the requirement the resume does not contain. */
+  missing: string[]
+  /** The closest line of the resume, when the check found one. */
+  closest: string | null
+  /** Plain-language explanation of why it is unclear and what to do. */
+  note: string
+  /** "skill": names tools or technologies; "work": describes the job's duties, nothing exact to look for in a resume. */
+  kind: 'skill' | 'work'
+}
+
+// Grammar and generic duty words: they say nothing about a skill, so they are not listed as "found" or "missing".
+const FILLER = new Set(('a an the and or of for to in on at by with from into over under up out off as is are be been it its this that these those our your their we you '
+  + 'carry define shape closely work working worked build building maintain design develop develops implement ensure participate collaborate support help '
+  + 'strong ability timely manner way across including such well new existing various related relevant good best great').split(' '))
+const meaningful = (words: string[]) => words.map((w) => w.trim()).filter((w) => w && !FILLER.has(w.toLowerCase()))
+const splitWords = (list: string | undefined) => (list ? list.split(/,\s*/) : [])
+const clip = (text: string, limit = 240) => {
+  const t = text.replace(/\s+/g, ' ').trim()
+  return t.length <= limit ? t : `${t.slice(0, limit).replace(/\s+\S*$/, '').replace(/[,;:(]+$/, '')}…`
+}
+// A requirement names something technical if it has an acronym, a digit, or a name written like a tool (GraphQL, Node.js, C++).
+const TOOL_SHAPE = /\b[A-Z]{2,}\b|\d|[a-z][A-Z]|[A-Za-z][.+#][A-Za-z+#]/                 // case-sensitive: ML, GraphQL, Node.js, C++
+const TOOL_WORD = /\b(?:python|java|react|node|sql|docker|kubernetes|aws|api|apis|rest|git|linux|swift|kotlin|flutter|django|flask|redis|kafka)\b/i
+const NAMES_A_TOOL = { test: (text: string) => TOOL_SHAPE.test(text) || TOOL_WORD.test(text) }
+
+/** Turn the fit check's wording ("<requirement> — only partly shown (found: a, b; not found: c)") into something a person can act on.
+ * Text in a format it does not know is shown as it came, never dropped. */
+export function explainUnclear(raw: string): UnclearItem {
+  const at = raw.indexOf(' — ')
+  const requirement = (at >= 0 ? raw.slice(0, at) : raw).replace(/[.\s]+$/, '').trim()
+  const rest = at >= 0 ? raw.slice(at + 3).trim() : ''
+  const kind: UnclearItem['kind'] = NAMES_A_TOOL.test(requirement) ? 'skill' : 'work'
+  const base = { requirement, found: [] as string[], missing: [] as string[], closest: null as string | null, kind }
+
+  const partly = rest.match(/^only partly shown \(found: (.*?); (?:not found: (.*)|but never together in one place)\)$/)
+  if (partly) {
+    const found = meaningful(splitWords(partly[1]))
+    const missing = meaningful(splitWords(partly[2]))
+    const together = !partly[2]
+    const note = together
+      ? 'Your resume mentions each of these, but never together in one place, so it is not clear you did this.'
+      : kind === 'skill'
+        ? 'Your resume has some of these words but not all of them. If you have really used them, add them in your own words. If not, leave it.'
+        : 'This describes the work itself rather than one tool, so there is nothing exact to look for. If you have done something like it, say so in your own words.'
+    return { ...base, found, missing, note }
+  }
+  const related = rest.match(/^related evidence exists \((.*)\) but it does not clearly meet the requirement$/)
+  if (related) {
+    return { ...base, closest: clip(related[1]), note: 'Your resume has related work (below), but it does not clearly show this requirement. Reword that line if it really covers it.' }
+  }
+  const years = rest.match(/^relevant work is shown \((.*)\), but the required amount of experience cannot be confirmed from the profile$/)
+  if (years) {
+    return { ...base, closest: clip(years[1]), note: 'Your resume shows relevant work, but the amount of experience the job asks for cannot be confirmed from it.' }
+  }
+  if (/^cannot be verified from the profile or resume text$/.test(rest)) {
+    return { ...base, note: 'This cannot be checked from resume text, so it is neither a plus nor a minus.' }
+  }
+  if (/^evidence cited but its wording does not match/.test(rest)) {
+    return { ...base, note: 'Something in your resume may be related, but its wording is too different to count as a match.' }
+  }
+  if (/^the stored profile is too sparse/.test(rest)) {
+    return { ...base, note: 'Your saved profile has too little detail to check this. Add more to your experience or projects.' }
+  }
+  return { ...base, note: rest }
+}

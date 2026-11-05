@@ -31,7 +31,7 @@ interface Props {
 const LABEL: Record<PositioningField, string> = { headline: 'headline', summary: 'summary', skills: 'highlighted skills' }
 
 /** Who wrote what: the AI's latest suggestion for a field, or the user's own edit of it. */
-function Source({ edited }: { edited: boolean }) {
+export function Source({ edited }: { edited: boolean }) {
   return edited ? (
     <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400">
       <Pencil size={11} aria-hidden /> Edited by you

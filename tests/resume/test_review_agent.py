@@ -416,3 +416,13 @@ def test_word_safe_never_cuts_inside_a_word():
         out = review._word_safe(text, limit)
         assert len(out) <= limit + 1 and (out.endswith((".", "…")))
     assert review._word_safe("short", 600) == "short"
+
+
+def test_wording_such_as_must_have_is_not_a_skill_the_resume_has_to_contain():
+    assert review._terms("Strong proficiency in React (must-have), along with JavaScript and TypeScript") == ["react", "javascript", "typescript"]
+    assert review._terms("Docker (nice-to-have)") == ["docker"]
+    profile = {**MOBILE_PROFILE, "skills": ["React, JavaScript, TypeScript, Node.js"]}
+    req = "Strong proficiency in React (must-have), along with JavaScript and TypeScript"
+    llm = FakeLLM([req], [a(1, "matching", "React, JavaScript, TypeScript")], EMPTY_DRAFT)
+    fa, _ = result(run(llm, profile=profile, jd=req)[0])
+    assert [i.split(" — ")[0] for i in fa["matching_requirements"]] == [req] and fa["uncertain_requirements"] == []

@@ -215,6 +215,9 @@ def _verify_prose(prose: _Prose, facts: dict) -> None:
     if unsupported:
         raise ValueError(f"summary mentions things not in the resume: {', '.join(dict.fromkeys(unsupported[:5]))}")
 
+    if facts.get("focus"):
+        positioning.check_focus(text, facts["focus"])                    # written for this job's focus, not a generic summary
+
     if not 8 <= len(words) <= 70 or not text.endswith((".", "!")):
         raise ValueError("summary is not 2 short sentences")
     if "|" in text:
@@ -247,6 +250,9 @@ def _llm_prose(job_description: str, facts: dict) -> _Prose | None:
         lines.append(f"Most recent role: {facts['title']}" + (f" at {facts['company']}" if facts["company"] else ""))
     if facts.get("profile_summary"):
         lines.append(f"The candidate's own summary: {facts['profile_summary']}")
+    if facts.get("focus"):
+        side = {"backend": "backend", "frontend": "frontend", "mobile": "mobile", "ai": "AI/LLM", "fullstack": "both frontend and backend"}[facts["focus"]]
+        lines.append(f"This job is a {facts['focus']} job. Write the summary about the candidate's {side} expertise only, and leave out unrelated work.")
     if facts["skills"]:
         lines.append(f"Skills you may mention (they match the job): {', '.join(facts['skills'])}")
     if facts["bullets"]:
@@ -301,16 +307,9 @@ def _build_draft(profile: dict,job_description: str,evidence: str, *, variant: i
         if _terms(skill) and set(_terms(skill)) <= jd_terms
     ]
 
-    matched_skills.sort(
-        key=lambda skill: min(
-            (
-                _terms(job_description).index(term)
-                for term in _terms(skill)
-                if term in _terms(job_description)
-            ),
-            default=9999,
-        )
-    )
+    # What the job wants most comes first (the title, repeated and "required" skills before "nice to have" ones); both PDF
+    # designs move the draft's skills to the front of their group in this order.
+    matched_skills = positioning.rank_skills(matched_skills, job_description, target_title)
 
     experience_items = []
     roles = []
@@ -418,10 +417,28 @@ def _build_draft(profile: dict,job_description: str,evidence: str, *, variant: i
     headline_role = positioning.supported_role(job_role, profile_blob)
     headline = positioning.build_headline(
         headline_role, title, matched_skills, positioning._years_phrase(_as_text(profile.get("summary"))), variant)
+    # What the job is about (backend / frontend / full-stack / mobile / AI), if the resume evidences it: the summary is then
+    # written for that focus, with its skills and its proofs, so it changes with the job description.
+    focus = positioning.supported_focus(positioning.job_focus(job_description, target_title), f"{profile_blob}\n{evidence}")
+    focus_groups = positioning.focus_skills(focus, skills, matched_skills) if focus else None
+    # Projects: only those that show what this job asks for (its skills and focus), best first. The others stay in the profile.
+    project_items, left_out_projects = positioning.select_projects(
+        project_items, matched_skills, positioning.job_focus(job_description, target_title))
+    if focus:
+        proofs = positioning.focused_accomplishments([item for _, item in experience_items], relevance, focus)
+        projects = positioning.focused_projects([item for _, item in project_items], relevance, focus)
+    else:
+        proofs = positioning.accomplishment_lines([item for _, item in experience_items], relevance)
+        projects = positioning.project_lines([item for _, item in project_items], relevance)
+    # Only lines that read like summary material: not "Owned the Sales app frontend end-to-end..." (a duty phrase with a product name).
+    known_terms = {t for skill in skills for t in _terms(skill)} | {t for t in _terms(profile_blob) if t in set(_terms(" ".join(skills)))}
+    proofs = [line for line in proofs if positioning.summary_worthy(line, known_terms)]
+    projects = [line for line in projects if positioning.summary_worthy(line, known_terms, allow_names=True)]
     summary = positioning.build_summary(
         profile_summary=_as_text(profile.get("summary")), title=title, company=company, skills=matched_skills,
-        accomplishments=positioning.accomplishment_lines([item for _, item in experience_items], relevance),
-        project_lines=positioning.project_lines([item for _, item in project_items], relevance), variant=variant,
+        accomplishments=proofs, project_lines=projects, variant=variant,
+        role=headline_role, years=positioning._years_phrase(_as_text(profile.get("summary"))),
+        focus=focus, focus_groups=focus_groups,
     ) or _shorten(_as_text(profile.get("summary")), 350) or None
 
     # Missing technical terms remain suggestions, never candidate skills.
@@ -467,6 +484,12 @@ def _build_draft(profile: dict,job_description: str,evidence: str, *, variant: i
             "or add real experience you have that it asks for."
         )
 
+    if left_out_projects:
+        recommendations.append(
+            "Left out of this resume because they do not show what this job asks for: "
+            + ", ".join(left_out_projects) + ". They are still in your profile."
+        )
+
     if claims:
         recommendations.append(
             "Review missing job requirements separately. "
@@ -492,8 +515,9 @@ def _build_draft(profile: dict,job_description: str,evidence: str, *, variant: i
     facts = {
         "title": title,
         "company": company,
-        "skills": matched_skills[:5],
-        "bullets": [
+        "skills": [x for group in (focus_groups or {}).values() for x in group[:3]] or matched_skills[:5],
+        "focus": focus,
+        "bullets": proofs or [
             _shorten(item.bullets[0], 180)
             for _, item in experience_items[:2]
             if item.bullets and relevance(item.bullets[0])

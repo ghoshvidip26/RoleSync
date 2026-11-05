@@ -36,11 +36,9 @@ def run(body, subject="Performance work and Cyberdyne Systems", profile=PROFILE,
         return OutreachAgent().run(profile, COMPANY, recipient)
 
 
-TEMPLATE_SUBJECT = "Sarah Connor: Backend Engineer interested in Cyberdyne Systems"
-
-
 def used_template(result):
-    return result.subject == TEMPLATE_SUBJECT
+    """The model's text was not used: the grounded template wrote the paragraphs (the subject is always rule-based)."""
+    return result.source == "template"
 
 
 def test_a_supported_email_is_used_as_written():
@@ -85,7 +83,7 @@ def test_the_template_is_built_from_the_real_background_and_passes_the_same_chec
     assert "I work mainly with Python, Kubernetes, PostgreSQL and Redis." in draft.body
     assert "Cyberdyne Systems" in draft.body and draft.body.rstrip().endswith("Sarah Connor")
     written = draft.body.split(oa.CLOSING_REGARDS)[0]                              # everything before the sign-off
-    oa._verify_email(DraftEmail(subject=draft.subject, body=written), PROFILE, COMPANY, RECIPIENT, evidence="")   # raises if it made a claim
+    oa._verify_email(DraftEmail(subject="Hello", body=written), PROFILE, COMPANY, RECIPIENT, evidence="")   # raises if it made a claim
 
 
 def test_the_template_picks_the_bullet_closest_to_the_recipient_and_works_for_a_sparse_profile():
@@ -140,7 +138,7 @@ def test_a_domain_the_model_split_with_a_space_is_repaired_and_the_link_is_not_a
 def test_a_profile_with_nothing_to_cite_always_gets_the_template():
     sparse = Profile(id="p2", name="John Doe", email="john@example.com", summary="Backend developer.")
     result = run(GOOD.replace("Sarah Connor", "John Doe"), profile=sparse)
-    assert result.subject == "John Doe: interested in Cyberdyne Systems" and "None" not in result.body
+    assert result.subject == "John Doe | Exploring Opportunities at Cyberdyne Systems" and "None" not in result.body and used_template(result)
 
 
 def test_the_template_prefers_languages_and_tools_over_general_concepts_and_reads_cleanly():

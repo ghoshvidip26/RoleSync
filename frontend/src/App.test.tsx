@@ -27,9 +27,10 @@ describe('which steps are open', () => {
   it('needs an approved draft for the design and a chosen design for the e-mail', () => {
     expect(lockReason('design', flow({ profile, job: JD, draft: draft('pending_review') }))).toMatch(/Approve/)
     expect(lockReason('design', flow({ profile, job: JD, draft: draft('approved') }))).toBeNull()
-    expect(lockReason('email', flow({ profile, job: JD, draft: draft('approved') }))).toMatch(/design/)
-    expect(lockReason('email', flow({ profile, job: JD, draft: draft('approved'), template: 'classic' }))).toBeNull()
-    expect(lockReason('email', flow({ profile, job: JD, draft: draft('rejected'), template: 'classic' }))).toMatch(/Approve/)
+    // writing the e-mail only needs a profile: without an approved resume the step warns and sends without an attachment
+    expect(lockReason('email', flow({ profile, job: JD, draft: draft('approved') }))).toBeNull()
+    expect(lockReason('email', flow({ profile, job: JD, draft: draft('rejected'), template: 'classic' }))).toBeNull()
+    expect(lockReason('email', flow({ profile }))).toBeNull()
   })
 })
 

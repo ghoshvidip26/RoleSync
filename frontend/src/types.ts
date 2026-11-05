@@ -44,15 +44,6 @@ export interface Job {
   description: string
 }
 
-export interface RoleRecommendation {
-  role_id: string
-  title: string
-  fit: string
-  score: number
-  matching: { required: string[]; preferred: string[] }
-  gaps: { required: string[]; preferred: string[] }
-}
-
 export interface ReviewResult {
   verdict: {
     fit_assessment: {
@@ -136,6 +127,29 @@ export interface EmailRecord {
   status: string
   resume_draft_id: string | null
   error: string | null
+}
+
+export interface PersonalLineResult {
+  text: string
+  basis: 'website' | 'job_description' | 'none'
+  source: string
+  evidence: string[]
+  limitation: string | null
+  website_status: string
+  website_reason: string | null
+}
+
+export interface AnswerResult {
+  answer: string
+  evidence: string[]
+  source: string
+  words: number
+}
+
+export interface AttachmentInfo {
+  has_attachment: boolean
+  filename: string | null
+  size_bytes?: number
 }
 
 export interface PdfResult {

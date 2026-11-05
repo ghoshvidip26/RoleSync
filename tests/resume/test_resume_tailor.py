@@ -96,8 +96,9 @@ def test_what_the_job_wants_but_the_resume_lacks_is_a_claim_to_confirm_never_a_s
 def test_headline_and_summary_are_built_from_the_real_resume_and_the_matching_skills():
     d = draft()
     assert d["headline"] == "Junior Mobile Developer | Python, PostgreSQL, Redis"        # no evidenced role in this JD: the real title
-    assert d["summary"].startswith("Mobile developer. Integrated rider payments and COD collection, supporting backend APIs.")
-    assert "Also hands-on with Python, PostgreSQL, Redis and REST APIs." in d["summary"]
+    # a backend job: the summary is a backend summary, with the candidate's own backend skills and proof
+    assert d["summary"].startswith("Backend developer with hands-on experience in PostgreSQL, Redis, REST APIs and SQL. Integrated rider payments and COD collection, supporting backend APIs.")
+    assert "Aforro" not in d["summary"].split(". ")[0] and "Junior" not in d["summary"]
 
 
 def test_every_original_bullet_is_kept_unchanged_with_the_most_relevant_first():
@@ -126,8 +127,9 @@ def test_only_named_real_projects_are_kept_and_never_given_an_invented_name():
 def test_a_job_title_noun_is_not_counted_as_a_skill_match():
     profile = {"skills": ["Python"], "projects": ["SearchTool | GitHub | Go\n• Built a search engine.",
                                                    "PyTool | GitHub | Python\n• Built tools in Python."]}
-    names = [p["name"] for p in draft(profile=profile, jd="Backend Engineer. Python.")["projects"]]
-    assert names == ["PyTool", "SearchTool"]          # "engine" is not "Engineer", so only PyTool matches the job
+    d = draft(profile=profile, jd="Backend Engineer. Python.")
+    assert [p["name"] for p in d["projects"]] == ["PyTool"]          # "engine" is not "Engineer", so only PyTool matches the job
+    assert any("SearchTool" in r and "still in your profile" in r for r in d["recommendations"])      # and the omission is explained
 
 
 def test_a_resume_with_no_overlap_gets_an_honest_explanation_not_an_empty_draft():
@@ -188,7 +190,8 @@ def test_verified_model_text_replaces_only_the_summary():
 def test_the_model_is_only_given_verified_facts_not_the_job_descriptions_skills():
     _, llm = tailor_with(GOOD)
     prompt = " ".join(text for _, text in llm.calls[0][0])
-    assert "Python, PostgreSQL, Redis" in prompt and "Junior Mobile Developer at Aforro" in prompt
+    assert "PostgreSQL, Redis, REST APIs" in prompt and "Junior Mobile Developer at Aforro" in prompt
+    assert "This job is a backend job" in prompt
     for jd_only in ("Kafka", "FastAPI", "Kubernetes"):
         assert jd_only not in prompt                                                  # nothing to copy that the candidate lacks
     assert llm.calls[0][1]["required"] == ["summary"]                                # `{}` is not an acceptable answer

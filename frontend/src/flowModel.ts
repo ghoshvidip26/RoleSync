@@ -1,9 +1,8 @@
-import type { DraftRecord, Job, OriginalAssessment, Profile, ReviewResult, RoleRecommendation } from './types.ts'
+import type { DraftRecord, Job, OriginalAssessment, Profile, ReviewResult } from './types.ts'
 
 /** Everything the user has done so far. Files cannot be saved, so a reload keeps the ids and text only. */
 export interface FitResult {
   jobDescription: string // the text these results belong to; a different description makes them stale
-  roles: RoleRecommendation[] | null
   review: ReviewResult | null
 }
 

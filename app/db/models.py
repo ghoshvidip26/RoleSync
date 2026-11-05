@@ -104,6 +104,17 @@ def fetch_all(table: str, **filters: Any) -> list[dict[str, Any]]:
     return [_unpack_row(table, r) for r in rows]
 
 
+def claim(table: str, id_: str, from_status: str, to_status: str, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Atomically move a row from `from_status` to `to_status`: one UPDATE ... WHERE id = ? AND status = ?.
+
+    Returns the updated row, or None when the row was not in `from_status` (someone else got there first).
+    This is what keeps two simultaneous approvals from both sending the same email.
+    """
+    db_data, _ = _prepare_for_db(table, {**(data or {}), "status": to_status})
+    rows = get_client().table(table).update(db_data).eq("id", id_).eq("status", str(getattr(from_status, "value", from_status))).execute().data
+    return _unpack_row(table, rows[0]) if rows else None
+
+
 def update(table: str, id_: str, data: dict[str, Any]) -> dict[str, Any]:
     db_data, extra = _prepare_for_db(table, data)
     updated = get_client().table(table).update(db_data).eq("id", id_).execute().data[0]

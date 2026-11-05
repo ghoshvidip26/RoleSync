@@ -1,4 +1,5 @@
 import email as email_lib
+import threading
 from email import policy
 from unittest.mock import MagicMock, patch
 
@@ -125,6 +126,7 @@ class World:
         self.drafts = {"d1": {"id": "d1", "profile_id": draft_profile, "job_description": "jd", "draft": APPROVED_DRAFT,
                               "status": draft_status, "created_at": "2026-10-01T10:00:00+00:00", "reviewed_at": None}}
         self.sent = []
+        self.lock = threading.Lock()
 
     def fetch(self, table, id_):
         return {"emails": self.emails, "resume_drafts": self.drafts,
@@ -135,6 +137,15 @@ class World:
         row.update({k: getattr(v, "value", v) for k, v in data.items()})
         return row
 
+    def claim(self, table, id_, from_status, to_status, data=None):
+        """Atomic like the database: only a row still in `from_status` moves."""
+        with self.lock:
+            row = self.emails[id_]
+            if row["status"] != getattr(from_status, "value", from_status):
+                return None
+            row.update({**(data or {}), "status": getattr(to_status, "value", to_status)})
+            return row
+
     def send(self, **kwargs):
         self.sent.append(kwargs)
 
@@ -144,7 +155,7 @@ def world(request, tmp_path, monkeypatch):
     monkeypatch.setenv("ORIGINAL_RESUME_DIR", str(tmp_path / "resumes"))
     w = World(**getattr(request, "param", {}))
     with patch.object(main.db, "fetch", w.fetch), patch.object(main.db, "update", w.update), \
-         patch.object(main.email_service, "send_email", w.send):
+         patch.object(main.db, "claim", w.claim), patch.object(main.email_service, "send_email", w.send):
         yield w
 
 
@@ -185,8 +196,8 @@ def test_the_users_own_design_is_attached_when_it_works(world):
 def test_an_email_without_a_tailored_resume_is_sent_exactly_as_before():
     w = World(resume_draft_id=None)
     with patch.object(main.db, "fetch", w.fetch), patch.object(main.db, "update", w.update), \
-         patch.object(main.email_service, "send_email", w.send):
-        r = client.post("/emails/e1/approve")
+         patch.object(main.db, "claim", w.claim), patch.object(main.email_service, "send_email", w.send):
+        r = client.post("/emails/e1/approve", params={"send_without_attachment": "true"})
     assert r.status_code == 200
     assert w.sent == [{"to_email": "miles@cyberdyne.ai", "subject": "Hello", "body": w.emails["e1"]["body"],
                        "from_email": "alex@example.com"}]

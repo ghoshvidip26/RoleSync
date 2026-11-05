@@ -312,6 +312,22 @@ def get_retriever(profile_id: str):
 class DraftEmail:
     subject: str
     body: str
+    words: int = 0                                      # words in the email itself (signature and included answers not counted)
+    notes: list[str] = field(default_factory=list)     # things the reviewer should know (e.g. "shorter than 120 words")
+    source: str = "template"                           # "model" when the language model's paragraphs were used, else "template"
+
+
+class _NoModel:
+    """Stands in when the model cannot be created: any use raises, which the callers already treat as "use the template"."""
+
+    def __init__(self, reason: Exception):
+        self._reason = reason
+
+    def with_structured_output(self, *_a, **_k):
+        raise RuntimeError(f"language model unavailable: {self._reason}")
+
+    def invoke(self, *_a, **_k):
+        raise RuntimeError(f"language model unavailable: {self._reason}")
 
 
 class _Draft(BaseModel):
@@ -321,22 +337,24 @@ class _Draft(BaseModel):
 
 SYSTEM_PROMPT = (
     "You write the middle of a short, genuine cold email from a job seeker to a founder or hiring manager. "
-    "The greeting, closing, sign-off and links are added by someone else: write ONLY these two short paragraphs, "
-    "separated by a blank line:\n"
-    "Paragraph 1 (1-2 sentences): who the candidate is, in plain words (role or focus, and where they most recently worked).\n"
-    "Paragraph 2 (2-3 sentences): the candidate's expertise and skill sets, naming specific tools or projects from the evidence.\n"
+    "The greeting, achievements, call to action, closing and links are added by someone else: write ONLY these two short "
+    "paragraphs, separated by a blank line:\n"
+    "Paragraph 1 (1-2 sentences): who the candidate is: their field, their professional experience (only if the evidence states "
+    "how long) and their current or most recent role and employer.\n"
+    "Paragraph 2 (1-2 sentences): the technologies and skills that matter for the target role, at most five, taken from the evidence.\n"
     "Rules:\n"
     "1. Ground every claim strictly in the candidate's resume excerpts and evidence. Never fabricate experience, metrics, or skills.\n"
-    "2. Do not write a greeting, a closing line, a sign-off, a signature, links or bullet points.\n"
-    "3. About 60 to 110 words in total. Plain words, no buzzwords, no filler such as 'I hope this email finds you well'.\n"
-    "4. Do not use placeholders, brackets like [Your Name] or [Link], or hypothetical details. If you lack a fact, leave it out.\n"
+    "2. Do not write a greeting, a closing line, a sign-off, a signature, links or bullet points, and do not describe achievements "
+    "or projects (they are listed separately): never repeat in paragraph 2 what paragraph 1 says.\n"
+    "3. 45 to 90 words in total. Natural, plain words in the first person, no buzzwords, no filler such as 'I hope this email finds you well'.\n"
+    "4. Never call the candidate a 'recent graduate'. Do not use placeholders, brackets like [Your Name] or [Link], or hypothetical details.\n"
     "5. This is a cold email, not a job application: never mention an application, an open position, a job posting or an attachment.\n"
-    "6. Say nothing about the company beyond its name. Also write a short subject line (under 60 characters)."
+    "6. Say nothing about the company beyond its name. Also write a short subject line (it is not used)."
 )
 
 ANSWER_PROMPT = (
-    "You answer one question that a founder or hiring manager asked the candidate, in the first person, in 2-3 sentences "
-    "(under 80 words). Say what the candidate can do for the role, and back it with one concrete thing from the evidence. "
+    "You answer one question that a founder or hiring manager asked the candidate, in the first person, in 1-2 sentences "
+    "and at most 45 words. Say what the candidate can do for the role, and back it with one concrete thing from the evidence. "
     "Rules: ground every claim strictly in the evidence; never fabricate experience, metrics or skills; no greeting, "
     "sign-off, bullet points, placeholders or links; say nothing about the company beyond its name."
 )
@@ -422,7 +440,18 @@ def _anchor_terms(profile: Profile) -> tuple[set[str], set[str]]:
     return stems(identity), stems(substance)
 
 
-def _verify_email(draft: "_Draft", profile: Profile, company: Company, recipient: Recipient, evidence: str) -> None:
+_GRADUATE_RE = re.compile(r"\brecent(?:ly)?\s+(?:graduat\w*|grads?)\b|\bfresh(?:er|\s+graduate)s?\b|\bnew\s+grad\w*\b|\bjust\s+graduated\b", re.I)
+_YEARS_RE = re.compile(r"\b(\d+)\+?\s*(?:years?|yrs?)\b", re.I)
+
+
+def _profile_years(profile: Profile) -> set[str]:
+    """The numbers of years the profile itself states ("1 year of experience" -> {"1"})."""
+    found = re.findall(r"\b(\d+)\+?\s*(?:years?|yrs?)\s+of\s+(?:professional\s+)?experience", f"{profile.summary or ''} {' '.join(profile.experience or [])}", re.I)
+    return set(found)
+
+
+def _verify_email(draft: "_Draft", profile: Profile, company: Company, recipient: Recipient, evidence: str,
+                  extra_allowed: str = "", min_words: int = 25, max_words: int = 180) -> None:
     """Raise ValueError unless every claim in the email is supported by the candidate's resume or by the
     company/recipient details we were given."""
     subject, body = draft.subject.strip(), draft.body.strip()
@@ -431,15 +460,20 @@ def _verify_email(draft: "_Draft", profile: Profile, company: Company, recipient
     text = f"{subject}\n{body[: signs[-1].start()] if signs else body}"
     context = _candidate_context(profile, evidence)
     given = f"{profile.name} {company.name} {company.website or ''} {recipient.name or ''} {recipient.role or ''}"
-    allowed = f"{context}\n{given}"
+    allowed = f"{context}\n{given}\n{extra_allowed}"
 
     if not 3 <= len(subject) <= 100:
         raise ValueError("subject is missing or too long")
     words = len(body.split())
-    if not 25 <= words <= 180:
-        raise ValueError(f"body has {words} words (expected 25-180)")
+    if not min_words <= words <= max_words:
+        raise ValueError(f"body has {words} words (expected {min_words}-{max_words})")
     if _PLACEHOLDER_RE.search(text):
         raise ValueError("contains a placeholder such as [Name] or {Company}")
+    if _GRADUATE_RE.search(text):
+        raise ValueError("calls the candidate a recent graduate")
+    unsupported_years = [n for n in _YEARS_RE.findall(text) if n not in _profile_years(profile)]
+    if unsupported_years:
+        raise ValueError(f"claims {unsupported_years[0]} years of experience, which the profile does not state")
     if _PROCESS_CLAIM_RE.search(text):
         raise ValueError("refers to an application or an open position that nobody mentioned")
     if _ATTACHMENT_RE.search(text):
@@ -627,13 +661,41 @@ def _current_role_with_dates(profile: Profile) -> tuple[str | None, str | None, 
     return None, None, False
 
 
-def _subject(profile: Profile, company: Company, title: str | None) -> str:
-    """Short and specific (the guidance is under about 60 characters): who, what, and where."""
-    for text in (f"{profile.name}: {title} interested in {company.name}" if title else "",
-                 f"{profile.name}: interested in {company.name}"):
-        if text and len(text) <= 70:
+SUBJECT_MAX = 78
+_SUBJECT_WITH_ROLE = (
+    "{role} Opportunity | {name}",
+    "Exploring {role} Opportunities at {company}",
+    "{name} | Interest in {role}",
+    "{role} at {company} | {name}",
+)
+_SUBJECT_WITHOUT_ROLE = (
+    "Exploring {family} Opportunities at {company}",
+    "{name} | {family} Exploring Opportunities",
+    "{family} Exploring Opportunities at {company} | {name}",
+)
+_SUBJECT_NO_FAMILY = ("{name} | Exploring Opportunities at {company}", "Exploring Opportunities at {company} | {name}")
+
+
+def _role_family(profile: Profile) -> str | None:
+    """The candidate's own kind of role ("Mobile Application Developer"): their real title without seniority words."""
+    from app.agents import positioning                                   # imported here: positioning imports this module
+    title, _ = _current_role(profile)
+    words = [w for w in (title or "").split() if re.sub(r"[^a-z]", "", w.lower()) not in positioning._SENIORITY]
+    return " ".join(words) or None
+
+
+def build_subject(profile: Profile, company: Company, role: str | None = None, variant: int = 0) -> str:
+    """A professional, specific subject. With a target role (from the job description or the user): "Backend Engineer
+    Opportunity | Vidip Ghosh". Without one it is an exploratory subject built from the candidate's real kind of role, never
+    a vacancy that nobody mentioned. Different variants give different patterns; the result fits one inbox line."""
+    values = {"name": profile.name, "company": company.name, "role": role or "", "family": _role_family(profile) or ""}
+    patterns = _SUBJECT_WITH_ROLE if role else (_SUBJECT_WITHOUT_ROLE if values["family"] else _SUBJECT_NO_FAMILY)
+    ordered = [patterns[(variant + i) % len(patterns)] for i in range(len(patterns))]
+    for pattern in ordered:
+        text = pattern.format(**values)
+        if len(text) <= SUBJECT_MAX:
             return text
-    return f"{profile.name}: interested in {company.name}"[:100]
+    return f"{profile.name} | Exploring Opportunities"[:SUBJECT_MAX]
 
 
 def _skill_list(profile: Profile) -> list[str]:
@@ -648,17 +710,19 @@ def _skill_list(profile: Profile) -> list[str]:
 MAX_EXPERTISE_SKILLS = 6
 
 
-def _expertise_skills(profile: Profile, tailored: dict | None) -> list[str]:
+def _expertise_skills(profile: Profile, tailored: dict | None, limit: int | None = None, job_text: str = "") -> list[str]:
     """What the expertise paragraph names: the approved tailored resume's skills first, then the candidate's
     other languages, frameworks and tools. General concepts (OOP, ...) are used only if there are too few tools."""
     tools: list[str] = []
     for field in (profile.programming_languages, profile.frameworks, profile.databases_tools):
         for item in field or []:
             tools += [p.strip() for p in re.split(r"[,;|]", item.split(":")[-1]) if p.strip()]
-    ordered = list(dict.fromkeys([*_tailored_facts(tailored)["skills"], *tools]))
+    wanted = _stems(job_text)
+    in_job = [t for t in tools if wanted and _stems(t) and _stems(t) <= wanted]         # the candidate's own skills the job mentions
+    ordered = list(dict.fromkeys([*_tailored_facts(tailored)["skills"], *in_job, *tools]))
     if len(ordered) < 3:
         ordered = list(dict.fromkeys([*ordered, *_skill_list(profile)]))
-    return ordered[:MAX_EXPERTISE_SKILLS]
+    return ordered[: limit or MAX_EXPERTISE_SKILLS]
 
 
 def _join_list(items: list[str]) -> str:
@@ -714,22 +778,23 @@ def _evidence(profile: Profile, tailored: dict | None) -> list[dict]:
     return items
 
 
-def _proof_line(item: dict, bullet: str) -> str:
+def _proof_line(item: dict, bullet: str, max_chars: int | None = None) -> str:
     """"StackSearch: Achieved sub-100 ms retrieval over 2,500+ documentation pages using Node.js, LangChain and FAISS"
     or "At Aforro: Delivered 6 rider order flows". The sentence is the resume's own, cut at a clause; the stack is
     the project's own technology list (the first five)."""
     prefix = f"{item['label']}: " if item["kind"] == "project" else (f"At {item['label']}: " if item["label"] else "")
     suffix = f" using {_join_list(item['tech'][:5])}" if item["tech"] else ""
-    room = max(60, MAX_PROOF_CHARS - len(prefix) - len(suffix))
+    room = max(60, (max_chars or MAX_PROOF_CHARS) - len(prefix) - len(suffix))
     return f"{prefix}{_clause_cut(bullet, room)}{suffix}"
 
 
 def _proof_points(profile: Profile, company: Company, recipient: Recipient, tailored: dict | None,
-                  limit: int = 3, skip_text: str = "", exclude: list[str] | None = None, note: str | None = None) -> list[str]:
+                  limit: int = 3, skip_text: str = "", exclude: list[str] | None = None, note: str | None = None,
+                  max_chars: int | None = None, rotate: int = 0, extra_terms: str = "") -> list[str]:
     """The best proof of work: the candidate's real projects (with their tech stacks) and roles, ranked by how
     well they fit this company, the recipient's role, the personal line and the tailored resume. Two projects and
     a role by default, projects first. Each line is a sentence from the resume, cut at a clause, never rewritten."""
-    wanted = _wanted_terms(company, recipient, tailored, note)
+    wanted = _wanted_terms(company, recipient, tailored, note) | _stems(extra_terms)
     covered = _stems(skip_text)
 
     def best_bullet(item: dict) -> str:
@@ -744,10 +809,12 @@ def _proof_points(profile: Profile, company: Company, recipient: Recipient, tail
     for i in range(max(len(ranked["project"]), len(ranked["work"]))):
         order += [ranked[k][i] for k in ("project", "work") if i < len(ranked[k])]
 
+    if order and rotate:                                    # regenerating: start from a different one
+        order = order[rotate % len(order):] + order[:rotate % len(order)]
     chosen: list[tuple[dict, str]] = []
     for item, bullet in order:
         words = _stems(bullet)
-        line = _proof_line(item, bullet)
+        line = _proof_line(item, bullet, max_chars)
         if words and len(words & covered) / len(words) > 0.7:      # the written paragraphs already say this
             continue
         if line in (exclude or []) or any(line == l for _, l in chosen):
@@ -771,70 +838,162 @@ def _summary_sentence(profile: Profile) -> str:
     return f"I have {m['rest']}." if m else ""
 
 
-def _template_paragraphs(profile: Profile, tailored: dict | None) -> list[str]:
-    """Intro and expertise paragraphs built only from the candidate's real background."""
-    title, employer, ongoing = _current_role_with_dates(profile)
+_PROFESSIONAL_YEARS = re.compile(r"\b(\d+\+?)\s*(years?)\s+of\s+(?:professional\s+)?experience\b", re.I)
+
+
+def _summary_lead(profile: Profile) -> tuple[str | None, str | None, str | None]:
+    """(the field, the years, what they have been doing) from the resume's own summary sentence, each None when it does
+    not say. "Software engineer with 1 year of experience shipping mobile and AI features." gives
+    ("software engineer", "1 year of professional experience", "shipping mobile and AI features")."""
+    text = " ".join((profile.summary or "").split())
+    first = re.split(r"(?<=[.!?])\s+", text)[0].rstrip(".!?") if text else ""
+    if not first or re.match(r"(?i)^(?:i|i'm|i’m|i've|i’ve|we|my|our)\b", first):
+        return None, None, None
+    role = re.match(r"^(?:an?\s+)?([A-Za-z][A-Za-z /&-]{2,40}?)\s+with\s+", first)
+    years = _PROFESSIONAL_YEARS.search(first)
+    doing = re.search(r"experience\s+((?:shipping|building|developing|delivering|working|designing|creating|leading|writing)\b.+)$", first, re.I)
+    return (role.group(1).lower() if role else None,
+            f"{years.group(1)} {years.group(2).lower()} of professional experience" if years else None,
+            doing.group(1) if doing else None)
+
+
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def _intro(profile: Profile, extra_sentence: bool = True) -> str:
+    """"I'm Vidip, a software engineer with 1 year of professional experience, currently working as a Junior Mobile
+    Application Developer at Aforro." Only what the profile says; never "recent graduate"."""
     first = profile.name.split()[0]
-    article = "an" if title and title[0].lower() in "aeiou" else "a"
+    title, employer, ongoing = _current_role_with_dates(profile)
+    field, years, doing = _summary_lead(profile)
+    head = f"I'm {first}"
+    if field and years:
+        head += f", {_article(field)} {field} with {years}"
+    elif field:
+        head += f", {_article(field)} {field}"
+    elif years:
+        head += f", with {years}"
     if title and employer and ongoing:
-        intro = f"I'm {first}, currently {article} {title} at {employer}."
+        text = f"{head}, currently working as {_article(title)} {title} at {employer}."
     elif title and employer:
-        intro = f"I'm {first}. Most recently I've worked as {article} {title} at {employer}."
+        text = f"{head}. Most recently I've worked as {_article(title)} {title} at {employer}."
     else:
-        intro = f"I'm {first}."
-    summary = _summary_sentence(profile)
-    if summary:
-        intro += f" {summary}"
-    skills = _expertise_skills(profile, tailored)     # the approved tailored resume decides what to lead with
-    paragraphs = [intro]
+        text = f"{head}."
+    if extra_sentence and doing and doing.split()[0].lower().endswith("ing"):
+        text += f" I've been {doing}."
+    return text
+
+
+def _template_paragraphs(profile: Profile, tailored: dict | None, skills_n: int | None = None, extra_sentence: bool = True,
+                         job_text: str = "") -> list[str]:
+    """Intro and relevant-skills paragraphs built only from the candidate's real background."""
+    paragraphs = [_intro(profile, extra_sentence)]
+    skills = _expertise_skills(profile, tailored, skills_n, job_text)     # the tailored resume and the job decide what to lead with
     if skills:
         paragraphs.append(f"I work mainly with {_join_list(skills)}.")
     return paragraphs
 
 
+BODY_MIN_WORDS, BODY_MAX_WORDS, ANSWER_MAX_WORDS = 120, 180, 45
+
+
+def _word_count(text: str) -> int:
+    return len([w for w in text.split() if w != "•"])
+
+
+def body_words(body: str) -> int:
+    """Words of the email itself: everything before the sign-off (the signature and links are not counted)."""
+    return _word_count(body.split(CLOSING_REGARDS)[0])
+
+
+def _call_to_action(company: Company, role: str | None, tailored: bool) -> str:
+    about = f"the {role} opportunity at {company.name}" if role else f"opportunities at {company.name}"
+    closing = RESUME_NOTE + " " if tailored else ""
+    return closing + f"I'd welcome a short conversation about {about}, and I look forward to hearing from you."
+
+
 def _assemble(profile: Profile, company: Company, recipient: Recipient, paragraphs: list[str],
               proof: list[str], tailored: bool, sections: list[tuple[str, str, list[str]]] | None = None,
-              note: str | None = None) -> str:
-    """greeting, paragraphs, proof of work, any answered questions, closing, sign-off."""
+              note: str | None = None, role: str | None = None) -> str:
+    """greeting, intro, skills, achievements, the company line, any answers the user chose to include, the call to
+    action, and the sign-off."""
     paragraphs = [p.strip() for p in paragraphs if p and p.strip()]
-    note = _tidy_note(note or "")
-    if note:                                    # the candidate's own words, with only the ending tidied
-        paragraphs = [f"{note} {paragraphs[0]}" if paragraphs else note, *paragraphs[1:]]
     out = [_greeting(recipient, company), ""]
     for p in paragraphs:
         out += [p, ""]
     if proof:
         out += [PROOF_HEADING, *[f"• {b}" for b in proof], ""]
+    note = _tidy_note(note or "")
+    if note:                                    # the candidate's own words (written or AI-suggested, then edited), ending tidied
+        out += [note, ""]
     for question, answer, bullets in sections or []:
         out += [question.strip(), answer.strip()]
         if bullets:
             out += ["", PROOF_HEADING, *[f"• {b}" for b in bullets]]
         out.append("")
-    closing = RESUME_NOTE + " " if tailored else ""
-    closing += f"I'd welcome a short conversation about opportunities at {company.name}, and I look forward to hearing from you."
-    out += [closing, "", CLOSING_REGARDS, profile.name]
+    out += [_call_to_action(company, role, tailored), "", CLOSING_REGARDS, profile.name]
     return "\n".join(out)
 
 
+# richest first: (achievements, characters per achievement, skills named, the extra "I've been ..." sentence)
+_LEVELS = [(3, 230, 5, True), (3, 170, 5, True), (3, 130, 4, True), (3, 110, 4, False),
+           (2, 170, 4, True), (2, 130, 4, False), (2, 100, 3, False), (1, 130, 3, False)]
+
+
+def _compose_body(profile: Profile, company: Company, recipient: Recipient, tailored: dict | None, note: str | None,
+                  sections: list[tuple[str, str, list[str]]] | None, role: str | None = None,
+                  model_paragraphs: list[str] | None = None, variant: int = 0, job_text: str = "") -> tuple[str, int, list[str]]:
+    """The email body, sized to BODY_MIN_WORDS..BODY_MAX_WORDS (answers and signature not counted). The richest
+    version that fits is used; nothing is invented to reach the minimum, so a very sparse profile may stay short
+    (and the third value says so). Returns (body, words, notes)."""
+    sources: list[list[str] | None] = [model_paragraphs] if model_paragraphs else []
+    sources.append(None)                                         # the grounded template, if the model's text cannot be made to fit
+    fallback: tuple[str, int] | None = None
+    for paragraphs_given in sources:
+        best: tuple[int, str, int] | None = None                 # (distance from the range, body, words) within this source
+        for proofs, chars, skills_n, extra in _LEVELS:
+            paragraphs = paragraphs_given or _template_paragraphs(profile, tailored, skills_n, extra, job_text)
+            proof = _proof_points(profile, company, recipient, tailored, limit=proofs, skip_text=" ".join(paragraphs),
+                                  note=note, max_chars=chars, rotate=variant, extra_terms=job_text[:3000])
+            core = _assemble(profile, company, recipient, paragraphs, proof, bool(tailored), None, note, role)
+            words = body_words(core)
+            full = _assemble(profile, company, recipient, paragraphs, proof, bool(tailored), sections, note, role)
+            if BODY_MIN_WORDS <= words <= BODY_MAX_WORDS:
+                return full, words, []
+            distance = max(BODY_MIN_WORDS - words, words - BODY_MAX_WORDS, 0)
+            if best is None or distance < best[0]:
+                best = (distance, full, words)
+        assert best is not None
+        # A verified model text is kept when it is merely short (nothing is invented to pad it); it is dropped only
+        # when no version of it can be brought under the maximum.
+        if best[2] <= BODY_MAX_WORDS or paragraphs_given is None:
+            fallback = (best[1], best[2])
+            break
+        fallback = fallback or (best[1], best[2])
+    assert fallback is not None
+    body, words = fallback
+    note_text = (f"The email is {words} words, shorter than the usual {BODY_MIN_WORDS} to {BODY_MAX_WORDS}: your profile has little more to add."
+                 if words < BODY_MIN_WORDS else f"The email is {words} words, longer than {BODY_MAX_WORDS}: consider trimming it.")
+    return body, words, [note_text]
+
+
 def _template_email(profile: Profile, company: Company, recipient: Recipient, tailored: dict | None = None,
-                    sections: list[tuple[str, str, list[str]]] | None = None, note: str | None = None) -> "DraftEmail":
+                    sections: list[tuple[str, str, list[str]]] | None = None, note: str | None = None,
+                    role: str | None = None, variant: int = 0, job_text: str = "") -> "DraftEmail":
     """A plain email built only from the candidate's real background and the details we were given."""
-    title, _ = _current_role(profile)
-    paragraphs = _template_paragraphs(profile, tailored)
-    proof = _proof_points(profile, company, recipient, tailored, skip_text=" ".join(paragraphs), note=note)
-    body = _assemble(profile, company, recipient, paragraphs, proof, bool(tailored), sections, note)
-    return DraftEmail(subject=_subject(profile, company, title), body=body)
+    body, words, notes = _compose_body(profile, company, recipient, tailored, note, sections, role, variant=variant, job_text=job_text)
+    return DraftEmail(subject=build_subject(profile, company, role, variant), body=body, words=words, notes=notes)
 
 
 def _template_answer(profile: Profile, company: Company, recipient: Recipient, tailored: dict | None,
                      shown: list[str] | None = None) -> tuple[str, list[str]]:
-    """A grounded answer to "why you?": what the candidate works with, then real proof of work not already shown."""
+    """A grounded answer to "why you?" in at most ANSWER_MAX_WORDS words, with real proof of work not already shown."""
     title, _ = _current_role(profile)
-    skills = _expertise_skills(profile, tailored)[:4]
+    skills = _expertise_skills(profile, tailored)[:3]
     first = profile.name.split()[0]
     if title:
-        article = "an" if title[0].lower() in "aeiou" else "a"
-        answer = f"I'm {first}, {article} {title}" + (f" with hands-on experience in {_join_list(skills)}." if skills else ".")
+        answer = f"I'm {first}, {_article(title)} {title}" + (f" with hands-on experience in {_join_list(skills)}." if skills else ".")
     else:
         answer = f"I have hands-on experience in {_join_list(skills)}." if skills else f"I'm {first}."
     answer += f" I'd be glad to put that experience to work at {company.name}."
@@ -889,7 +1048,16 @@ class OutreachAgent:
     """
 
     def run(self, profile: Profile, company: Company, recipient: Recipient, tailored: dict | None = None,
-            questions: list[str] | None = None, personal_note: str | None = None) -> DraftEmail:
+            questions: list[str] | None = None, personal_note: str | None = None, *,
+            answers: list[dict] | None = None, job_description: str | None = None, job_title: str | None = None,
+            variant: int = 0, part: str = "both") -> DraftEmail:
+        """`answers` are question/answer pairs the user wrote or approved: they are used as written. `questions` are
+        answered here (older behaviour). `part` is "both", "subject" or "body": asking for one part computes only that
+        part. `variant` > 0 asks for a different version."""
+        from app.agents import positioning                       # imported here: positioning imports this module
+        role = positioning.target_role(job_description or "", job_title)
+        if part == "subject":                                    # rule-based: no model, no retrieval
+            return DraftEmail(subject=build_subject(profile, company, role, variant), body="")
         retriever = get_retriever(profile.id)
         retrieved_texts: list[str] = []
 
@@ -945,11 +1113,16 @@ class OutreachAgent:
             f"Candidate Evidence:\n{context}\n\n"
             f"{tailored_block}"
             f"Recipient: {recipient.name or 'Team'} ({recipient.role or 'Hiring Contact'}) "
-            f"at {company.name} {company.website or ''}\n\n"
+            f"at {company.name} {company.website or ''}\n"
+            + (f"Target role: {role}\n" if role else "No specific vacancy is known: this is an exploratory message.\n") + "\n"
             "Write the two paragraphs and a short subject line."
         )
 
-        llm = get_llm()
+        try:
+            llm = get_llm(0.0 if variant == 0 else 0.7)           # a regenerated version needs some variety
+        except Exception as exc:                                  # no model at all: every call below then falls back to the grounded template
+            logger.warning("No language model available (%s); the grounded template will be used", exc)
+            llm = _NoModel(exc)
         draft: _Draft | None = None
 
         # 1. Primary: Pydantic structured output
@@ -999,24 +1172,22 @@ class OutreachAgent:
         if draft is not None:
             draft = _Draft(subject=_SPLIT_DOMAIN_RE.sub(r"\1.\2", draft.subject), body=_SPLIT_DOMAIN_RE.sub(r"\1.\2", draft.body))
             try:
-                _verify_email(draft, profile, company, recipient, evidence)
+                _verify_email(draft, profile, company, recipient, evidence, extra_allowed=role or "")
                 paragraphs = [x.strip() for x in re.split(r"\n\s*\n", _middle(draft.body)) if x.strip()]
-                subject = draft.subject.strip() if len(draft.subject.strip()) <= 70 else None
             except ValueError as exc:
                 logger.warning("Model-written email not used (grounded template used instead): %s", exc)
-        title, _ = _current_role(profile)
-        if not paragraphs:
-            paragraphs = _template_paragraphs(profile, tailored)
-        subject = subject or _subject(profile, company, title)
+        subject = build_subject(profile, company, role, variant)      # rule-based: the model's subject line is not used
 
-        proof = _proof_points(profile, company, recipient, tailored, skip_text=" ".join(paragraphs), note=personal_note)
-        sections, shown = [], list(proof)
+        # Answers the user wrote or approved go in as written; questions given without an answer are answered here.
+        sections: list[tuple[str, str, list[str]]] = [(a["question"], a["answer"], []) for a in (answers or [])
+                                                      if a.get("question") and a.get("answer")]
+        shown: list[str] = []
         for q in (questions or []):
-            answer, bullets = self._answer(llm, q, profile, company, recipient, tailored, evidence, context,
-                                           tailored_block, shown)
-            sections.append((q, answer, bullets))
+            answer, bullets = self._answer(llm, q, profile, company, recipient, tailored, evidence, context, tailored_block, shown)
+            sections.append((q, answer, []))                      # concise: the answer only
             shown += bullets
-        body = _assemble(profile, company, recipient, paragraphs, proof, bool(tailored), sections, personal_note)
+        body, words, notes = _compose_body(profile, company, recipient, tailored, personal_note, sections, role,
+                                           model_paragraphs=paragraphs or None, variant=variant, job_text=job_description or "")
 
         # Candidate links go under the signature
         if links_list:
@@ -1024,7 +1195,8 @@ class OutreachAgent:
             if missing_links:
                 body = body + "\n" + "\n".join(missing_links)
 
-        return DraftEmail(subject=subject, body=body)
+        used_model = bool(paragraphs) and all(p in body for p in paragraphs)
+        return DraftEmail(subject=subject, body=body, words=words, notes=notes, source="model" if used_model else "template")
 
     def _answer(self, llm, question: str, profile: Profile, company: Company, recipient: Recipient,
                 tailored: dict | None, evidence: str, context: str, tailored_block: str,

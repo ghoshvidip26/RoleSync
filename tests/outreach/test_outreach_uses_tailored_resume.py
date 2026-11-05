@@ -80,7 +80,7 @@ def test_an_email_still_cannot_claim_something_the_tailored_resume_only_listed_a
             "so I'd love to hear how Cyberdyne Systems thinks about performance. Would you be open to a short conversation?"
             "\n\nBest regards,\nSarah Connor")
     result, _ = run_agent(TAILORED, body)
-    assert result.subject == "Sarah Connor: Backend Engineer interested in Cyberdyne Systems"   # Terraform is not in the resume
+    assert result.source == "template" and "Terraform" not in result.body                       # Terraform is not in the resume
 
 
 def test_an_email_that_uses_the_tailored_emphasis_is_accepted():

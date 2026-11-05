@@ -106,20 +106,21 @@ def test_the_summary_is_the_resumes_own_statements_without_repeating_skills():
     assert s.startswith("Software engineer with 1 year of experience shipping mobile, backend, and AI features in TypeScript, Python, and React Native.")
     assert "Delivered 6 rider order flows via REST APIs." in s
     assert s.count("React Native") == 1                                        # already said in the first sentence: not listed again
-    assert "Also hands-on with JavaScript, Firebase and Razorpay." in s
+    assert "Also works with JavaScript, Firebase and Razorpay." in s
 
 
 def test_summary_variants_are_different_and_all_grounded_in_the_resume():
     texts = [_summary(v) for v in range(3)]
     assert len(set(texts)) == 3
-    assert "StackSearch" in texts[1] and texts[2].startswith("Junior Mobile Application Developer at Aforro.")
+    assert "StackSearch" in texts[1]
+    assert not any("Aforro" in t or t.startswith("Junior") for t in texts)         # the job title and company are not the summary
     for text in texts:
         assert len(text) <= pos.SUMMARY_MAX and text.endswith(".")
         clean = lambda value: {w.strip(".,()") for w in value.lower().split() if len(w.strip(".,()")) > 3}
         for sentence in [x for x in text.split(". ") if x]:
             words = clean(sentence)
             source = (PROFILE["summary"] + " Delivered rider order flows REST APIs Optimized PostgreSQL schemas queries production features "
-                      "Achieved sub-100 ms retrieval over 2,500+ documentation pages StackSearch Also hands-on with JavaScript Firebase and Razorpay "
+                      "Achieved sub-100 ms retrieval over 2,500+ documentation pages StackSearch Also works with JavaScript Firebase and Razorpay "
                       "Junior Mobile Application Developer at Aforro").lower()
             assert words <= clean(source), sentence
 
@@ -133,10 +134,30 @@ def test_the_summary_never_exceeds_its_limit_and_cuts_only_between_sentences():
     assert len(s) <= pos.SUMMARY_MAX and s.endswith(".")
 
 
-def test_without_a_resume_summary_the_summary_leads_with_the_real_role():
-    s = _summary(0, profile_summary=None)
-    assert s.startswith("Junior Mobile Application Developer at Aforro.")
-    assert _summary(0, profile_summary="I build things with care and attention every day.").startswith("Junior Mobile Application Developer at Aforro.")
+def test_without_a_resume_summary_the_summary_says_who_the_candidate_is_not_their_job_line():
+    expected = "Developer with hands-on experience in React Native, JavaScript, Firebase and Razorpay."
+    for own in (None, "I build things with care and attention every day.", "Mobile developer."):    # first-person or title-only: not a statement
+        s = _summary(0, profile_summary=own)
+        assert s.startswith(expected)
+        assert "Aforro" not in s and "Junior" not in s and " at " not in s.split(". ")[0]
+
+
+def test_the_text_the_upload_step_generates_is_not_taken_for_the_candidates_own_summary():
+    generated = "Junior Mobile Application Developer | Aforro, Bengaluru Skilled in REST APIs, Node.js, PostgreSQL, LLMs, React.js."
+    s = _summary(0, profile_summary=generated)
+    assert s.startswith("Developer with hands-on experience in React Native") and "Aforro" not in s and "Skilled in" not in s
+
+
+def test_the_stated_years_and_an_evidenced_role_open_the_summary():
+    s = _summary(0, profile_summary=None, role="Backend Engineer", years="1 year of experience")
+    assert s.startswith("Backend Engineer with 1 year of experience, building with React Native, JavaScript, Firebase and Razorpay.")
+    assert "years" not in _summary(0, profile_summary=None)                                 # never invented when the resume does not say
+
+
+def test_the_summary_makes_no_claim_the_title_does_not_support():
+    # a non-software title is never turned into a software one
+    s = pos.build_summary(profile_summary=None, title="Mechanical Engineer", company="Acme", skills=["CAD"], accomplishments=[], project_lines=[], variant=0)
+    assert s == "Engineer with hands-on experience in CAD."
 
 
 def test_a_sparse_profile_still_gives_a_summary_or_nothing_never_an_error():

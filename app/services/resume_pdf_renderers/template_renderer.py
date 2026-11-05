@@ -72,6 +72,9 @@ def _skills(profile: dict, draft: dict) -> list[tuple[str, list[str]]]:
     used = {v.lower() for _, vals in groups for v in vals}
     groups.append(("Skills" if not any(vals for _, vals in groups) else "Other", [v for v in other if v.lower() not in used]))
     out = [(label, ordered(vals)) for label, vals in groups if vals]
+    # the first group stays first; the others go by how many of the job's skills they hold (stable: equal groups keep their order)
+    count = lambda vals: sum(1 for v in vals if re.sub(r"[^a-z0-9+#]", "", v.lower()) in highlight)
+    out = out[:1] + sorted(out[1:], key=lambda group: -count(group[1]))
     if not out and highlight:
         out = [("Skills", _list(draft.get("skills")))]
     return out

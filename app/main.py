@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from datetime import datetime, timezone
+import dataclasses
 import logging
 import re
 import unicodedata
@@ -24,10 +25,9 @@ from app.models.email import Email, EmailStatus, EmailUpdate
 from app.models.profile import ExtractedProfile, Profile, ProfileCreate
 from app.models.recipient import Recipient, RecipientCreate
 from app.models.resume_draft import ResumeDraftRecord, ResumeDraftStatus
-from app.services import email_service, outreach_agent, resume_service
+from app.services import email_service, outreach_agent, outreach_personal, resume_service
 from fastapi.middleware.cors import CORSMiddleware
 from app.agents.review import ReviewError, orchestrate
-from app.agents.role_recommender import recommend_roles
 from app.agents.tailoring_decision import needs_tailoring
 from app.agents.resume_tailor import ResumeTailorError, suggest_field, tailor_resume
 from fastapi.responses import JSONResponse, Response
@@ -60,6 +60,11 @@ class OutreachRequest(BaseModel):
     questions: list[str] = Field(default_factory=list, max_length=4)
     # One sentence in the candidate's own words about why this company (used exactly as written, first in the intro).
     personal_note: str | None = Field(default=None, max_length=240)
+    # Answers the user already reviewed or edited (used word for word, never regenerated here).
+    answers: list["AnswerItem"] = Field(default_factory=list, max_length=4)
+    # The posting, for the job-aware skills and role. Taken from the tailored resume's draft when omitted.
+    job_description: str | None = Field(default=None, max_length=30000)
+    job_title: str | None = Field(default=None, max_length=120)
 
     @field_validator("questions")
     @classmethod
@@ -75,6 +80,19 @@ class OutreachRequest(BaseModel):
     def _clean_note(cls, value: str | None) -> str | None:
         value = " ".join((value or "").split())
         return value or None
+
+
+class AnswerItem(BaseModel):
+    question: str = Field(min_length=3, max_length=200)
+    answer: str = Field(min_length=1, max_length=600)
+
+    @field_validator("question", "answer")
+    @classmethod
+    def _tidy(cls, value: str) -> str:
+        return " ".join(value.split())
+
+
+OutreachRequest.model_rebuild()
 
 
 def _get_entity(table: str, id_: str) -> dict[str, Any]:
@@ -151,13 +169,11 @@ def get_recipient(recipient_id: str):
     return _get_entity(db.RECIPIENTS, recipient_id)
 
 
-# --- Outreach & Email Endpoints ---
-@app.post("/outreach", response_model=Email, status_code=201)
-def create_outreach(req: OutreachRequest):
-    """Retrieve candidate evidence via RAG, generate cold email draft, and hold for human review."""
-    profile_dict = _get_entity(db.PROFILES, req.profile_id)
-    company_dict = _get_entity(db.COMPANIES, req.company_id)
-    recipient_dict = _get_entity(db.RECIPIENTS, req.recipient_id)
+def _outreach_inputs(profile_id: str, company_id: str, recipient_id: str, resume_draft_id: str | None):
+    """(profile, company, recipient, tailored draft or None, that draft's job description or None), all validated."""
+    profile_dict = _get_entity(db.PROFILES, profile_id)
+    company_dict = _get_entity(db.COMPANIES, company_id)
+    recipient_dict = _get_entity(db.RECIPIENTS, recipient_id)
 
     profile = Profile(**profile_dict)
     company = Company(**company_dict)
@@ -167,20 +183,28 @@ def create_outreach(req: OutreachRequest):
         # A recipient saved before addresses were validated: fail now, not after the email is approved.
         raise HTTPException(
             422,
-            f"Recipient {req.recipient_id} has an invalid email address ({recipient_dict.get('email')!r}). "
+            f"Recipient {recipient_id} has an invalid email address ({recipient_dict.get('email')!r}). "
             "Fix the recipient before generating outreach.",
         )
 
-    tailored = None
-    if req.resume_draft_id:
-        draft_record = _get_resume_draft(req.resume_draft_id)
-        if draft_record.profile_id != req.profile_id:
+    tailored, job_description = None, None
+    if resume_draft_id:
+        draft_record = _get_resume_draft(resume_draft_id)
+        if draft_record.profile_id != profile_id:
             raise HTTPException(409, "That tailored resume belongs to a different profile")
         if draft_record.status != ResumeDraftStatus.APPROVED:
             raise HTTPException(
                 409, f"Only an approved tailored resume can be used (current: {draft_record.status.value})"
             )
-        tailored = draft_record.draft
+        tailored, job_description = draft_record.draft, draft_record.job_description
+    return profile, company, recipient, tailored, job_description
+
+
+# --- Outreach & Email Endpoints ---
+@app.post("/outreach", response_model=Email, status_code=201)
+def create_outreach(req: OutreachRequest):
+    """Retrieve candidate evidence via RAG, generate cold email draft, and hold for human review."""
+    profile, company, recipient, tailored, draft_jd = _outreach_inputs(req.profile_id, req.company_id, req.recipient_id, req.resume_draft_id)
 
     # Insert draft entry
     row = db.insert(
@@ -197,8 +221,10 @@ def create_outreach(req: OutreachRequest):
     email_id = row["id"]
 
     try:
-        extras = {k: v for k, v in (("questions", req.questions), ("personal_note", req.personal_note)) if v}
-        draft = agent.run(profile, company, recipient, tailored=tailored, **extras)
+        extras = {k: v for k, v in (("questions", req.questions), ("personal_note", req.personal_note),
+                                    ("answers", [a.model_dump() for a in req.answers]),
+                                    ("job_title", req.job_title)) if v}
+        draft = agent.run(profile, company, recipient, tailored=tailored, job_description=req.job_description or draft_jd, **extras)
         updated = db.update(
             db.EMAILS,
             email_id,
@@ -218,6 +244,103 @@ def create_outreach(req: OutreachRequest):
             {"status": EmailStatus.FAILED, "error": str(exc)},
         )
         return Email(**failed)
+
+class _OutreachContext(BaseModel):
+    profile_id: str
+    company_id: str
+    recipient_id: str
+    resume_draft_id: str | None = None
+    job_description: str | None = Field(default=None, max_length=30000)
+    job_title: str | None = Field(default=None, max_length=120)
+    variant: int = Field(default=0, ge=0, le=50)       # 0 the first suggestion; each regenerate asks for the next
+
+
+class PersonalLineRequest(_OutreachContext):
+    pass
+
+
+class AnswerRequest(_OutreachContext):
+    question: str = Field(min_length=3, max_length=200)
+
+    @field_validator("question")
+    @classmethod
+    def _q(cls, value: str) -> str:
+        return " ".join(value.split())
+
+
+@app.post("/outreach/personal-line")
+def suggest_personal_line(req: PersonalLineRequest):
+    """One company-specific sentence for the email, grounded in the job description and the company's public website.
+    Nothing is saved. `limitation` says what could not be done (e.g. the website could not be read)."""
+    profile, company, recipient, tailored, draft_jd = _outreach_inputs(req.profile_id, req.company_id, req.recipient_id, req.resume_draft_id)
+    result = outreach_personal.generate_personal_line(
+        profile, company, recipient, job_description=req.job_description or draft_jd, job_title=req.job_title,
+        tailored=tailored, variant=req.variant)
+    return dataclasses.asdict(result)
+
+
+@app.post("/outreach/answer")
+def suggest_answer(req: AnswerRequest):
+    """A concise (45 words at most) answer to one question, grounded in the candidate's resume, with its evidence.
+    Nothing is saved."""
+    profile, company, recipient, tailored, draft_jd = _outreach_inputs(req.profile_id, req.company_id, req.recipient_id, req.resume_draft_id)
+    result = outreach_personal.answer_question(
+        profile, company, recipient, req.question, tailored=tailored, job_description=req.job_description or draft_jd,
+        job_title=req.job_title, variant=req.variant)
+    return dataclasses.asdict(result)
+
+
+class RegenerateRequest(BaseModel):
+    part: Literal["subject", "body"]
+    variant: int = Field(default=1, ge=0, le=50)
+    personal_note: str | None = Field(default=None, max_length=240)
+    answers: list[AnswerItem] = Field(default_factory=list, max_length=4)
+    job_description: str | None = Field(default=None, max_length=30000)
+    job_title: str | None = Field(default=None, max_length=120)
+
+    @field_validator("personal_note")
+    @classmethod
+    def _note(cls, value: str | None) -> str | None:
+        return " ".join((value or "").split()) or None
+
+
+@app.post("/emails/{email_id}/regenerate")
+def regenerate_email_part(email_id: str, req: RegenerateRequest):
+    """A new subject OR a new body for this email. Returns only the part asked for and saves nothing, so the other part
+    and anything the user edited are untouched; the client applies it with PATCH /emails/{id} once the user accepts it."""
+    email = Email(**_get_entity(db.EMAILS, email_id))
+    if email.status not in (EmailStatus.PENDING_REVIEW, EmailStatus.FAILED):
+        raise HTTPException(409, f"Only an email that has not been sent can be regenerated (current: {email.status.value})")
+    profile, company, recipient, tailored, draft_jd = _outreach_inputs(email.profile_id, email.company_id, email.recipient_id, email.resume_draft_id)
+    jd = req.job_description or draft_jd
+    answers = [a.model_dump() for a in req.answers]
+    try:
+        draft = agent.run(profile, company, recipient, tailored=tailored, personal_note=req.personal_note, answers=answers,
+                          job_description=jd, job_title=req.job_title, variant=req.variant, part=req.part)
+    except Exception as exc:
+        logger.exception("Could not regenerate the %s of email %s: %s", req.part, email_id, exc)
+        raise HTTPException(502, f"Could not write a new {req.part}: {exc}")
+    if req.part == "subject":
+        return {"part": "subject", "subject": draft.subject}
+    return {"part": "body", "body": draft.body, "words": draft.words, "notes": draft.notes, "source": draft.source}
+
+
+@app.get("/emails/{email_id}/attachment-info")
+def email_attachment_info(email_id: str, template: str | None = None):
+    """What approving this email would attach, checked now: the exact file name, size and page count.
+    `has_attachment` is false when the email is not tied to an approved tailored resume (nothing is ever attached then)."""
+    email = Email(**_get_entity(db.EMAILS, email_id))
+    if not email.resume_draft_id:
+        return {"has_attachment": False, "filename": None}
+    profile_row = _get_entity(db.PROFILES, email.profile_id)
+    attachments, needs_choice = _resume_attachment(email, profile_row, template)
+    if needs_choice is not None:
+        return needs_choice
+    name, data, mime = attachments[0]
+    if not data.startswith(b"%PDF"):
+        raise HTTPException(422, "The resume PDF could not be generated correctly, so it will not be attached")
+    return {"has_attachment": True, "filename": name, "size_bytes": len(data), "content_type": mime}
+
 
 @app.get("/emails", response_model=list[Email])
 def list_emails(status: EmailStatus | None = None):
@@ -251,26 +374,55 @@ def _attachment_name(profile_row: dict[str, Any]) -> str:
 
 
 @app.post("/emails/{email_id}/approve", response_model=Email)
-def approve_and_send_email(email_id: str, template: str | None = None):
+def approve_and_send_email(email_id: str, template: str | None = None, send_without_attachment: bool = False,
+                           confirm_retry: bool = False):
     """Approve draft and deliver via SMTP.
 
     An email written from an approved tailored resume goes out with that resume attached as a PDF.
     ``template`` picks its design (see GET /resume-templates, or ``original``); when it is needed and
     missing the answer is 409 with the gallery and the email stays pending review.
-    """
-    email_row = _get_entity(db.EMAILS, email_id)
-    email = Email(**email_row)
 
-    if email.status != EmailStatus.PENDING_REVIEW:
+    An email with no tailored resume is only sent when ``send_without_attachment=true`` (the original upload is never
+    attached). The email is claimed with one atomic status change (pending_review -> sending), so two simultaneous
+    approvals cannot both send: the second gets 409. A failed email keeps its content and can be sent again only with
+    ``confirm_retry=true``, after the caller has checked that the earlier attempt did not reach the recipient.
+    """
+    email = Email(**_get_entity(db.EMAILS, email_id))
+
+    if email.status == EmailStatus.FAILED:
+        if email.sent_at or not (email.subject and email.body):
+            raise HTTPException(409, "This email cannot be sent again" + (" because it was already sent" if email.sent_at else ": it has no content"))
+        if not confirm_retry:
+            return JSONResponse(status_code=409, content={
+                "detail": "The previous attempt failed" + (f" ({email.error})" if email.error else "") +
+                          ". Check that it did not reach the recipient, then confirm to try again.",
+                "action": "confirm_retry"})
+        from_status = EmailStatus.FAILED
+    elif email.status == EmailStatus.PENDING_REVIEW:
+        from_status = EmailStatus.PENDING_REVIEW
+    else:
         raise HTTPException(409, f"Only emails pending review can be approved (current: {email.status.value})")
 
     profile_row = _get_entity(db.PROFILES, email.profile_id)
     recipient_row = _get_entity(db.RECIPIENTS, email.recipient_id)
+    try:
+        Recipient(**recipient_row)
+    except ValidationError:
+        raise HTTPException(422, f"The recipient's email address ({recipient_row.get('email')!r}) is not valid. Fix it before sending.")
+
+    if not email.resume_draft_id and not send_without_attachment:
+        return JSONResponse(status_code=409, content={
+            "detail": "This email has no approved tailored resume, so it would be sent without an attachment. Confirm to send it that way.",
+            "action": "confirm_no_attachment"})
 
     # Built before anything is sent or recorded: no resume, no email.
     attachments, needs_choice = _resume_attachment(email, profile_row, template)
     if needs_choice is not None:
         return needs_choice
+
+    claimed = db.claim(db.EMAILS, email_id, from_status, EmailStatus.SENDING, {"error": None})
+    if claimed is None:
+        raise HTTPException(409, "This email is already being sent or was already handled; it was not sent again")
 
     try:
         email_service.send_email(
@@ -280,24 +432,17 @@ def approve_and_send_email(email_id: str, template: str | None = None):
             from_email=profile_row.get("email"),
             **({"attachments": attachments} if attachments else {}),
         )
-        updated = db.update(
-            db.EMAILS,
-            email_id,
-            {
-                "status": EmailStatus.SENT,
-                "sent_at": datetime.now(timezone.utc),
-                "error": None,
-            },
-        )
-        return Email(**updated)
     except Exception as exc:
         logger.exception("Failed to send email %s via SMTP: %s", email_id, exc)
-        failed = db.update(
-            db.EMAILS,
-            email_id,
-            {"status": EmailStatus.FAILED, "error": str(exc)},
-        )
+        failed = db.update(db.EMAILS, email_id, {"status": EmailStatus.FAILED, "error": str(exc)})
         return Email(**failed)
+    try:
+        updated = db.update(db.EMAILS, email_id, {"status": EmailStatus.SENT, "sent_at": datetime.now(timezone.utc), "error": None})
+    except Exception:
+        # The message went out; only the record failed. It stays "sending", which no retry can pick up: never a duplicate.
+        logger.exception("Email %s was sent but could not be marked sent", email_id)
+        raise HTTPException(500, "The email was sent, but its status could not be saved. Do not send it again.")
+    return Email(**updated)
 
 @app.patch("/emails/{email_id}", response_model=Email)
 def edit_email(email_id: str, data: EmailUpdate):
@@ -350,16 +495,6 @@ def review_profile(
         raise HTTPException(409, str(exc))
     result["tailoring"] = needs_tailoring(profile, data.job_description)
     return result
-
-@app.post("/profiles/{profile_id}/recommend-roles")
-def recommend_profile_roles(profile_id: str):
-    """Which known roles fit this profile best, and what each one is missing."""
-    profile = db.fetch(db.PROFILES, profile_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    return {"profile_id": profile_id, "recommendations": recommend_roles(profile)}
-
-
 class ResumeTailorRequest(BaseModel):
     job_description: str
     # The job's title, if the user gave one: the headline is written for that role (when the resume supports it).

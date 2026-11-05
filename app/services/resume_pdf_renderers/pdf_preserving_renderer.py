@@ -534,6 +534,11 @@ class _Composer:
                 rows[-1].append(dict(g, _y=y))
             else:
                 rows.append([dict(g, _y=y)])
+        # The rows that cover the most of what the job asks for come first, right after the first row (Languages): a frontend job
+        # moves the Frontend row up. A row is kept whole (groups that share a line stay together), so the page length does not change.
+        if len(rows) > 2:
+            hits = lambda row: sum(len(g.get("highlighted") or []) for g in row)
+            rows = [rows[0], *sorted(rows[1:], key=lambda row: -hits(row))]           # a stable sort: equal rows keep their order
         units = []
         for row in rows:
             segs: list[Seg] = []

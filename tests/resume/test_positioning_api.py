@@ -40,7 +40,7 @@ def test_each_field_gets_a_suggestion_and_nothing_is_saved():
     assert head.status_code == 200 and head.json()["field"] == "headline"
     assert head.json()["value"].startswith("React Native Developer | ")
     summary, _ = suggest({"field": "summary"})
-    assert summary.json()["value"].startswith("Software engineer with 1 year of experience")
+    assert summary.json()["value"].startswith("React Native Developer with 1 year of experience")
     skills, _ = suggest({"field": "skills"})
     assert skills.json()["value"][0] == "React Native" and isinstance(skills.json()["value"], list)
     assert rows.writes == []                                                     # a suggestion never changes the stored draft

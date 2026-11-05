@@ -170,7 +170,7 @@ include such etc eg ie other related least minimum role position candidate ideal
 responsible responsibilities responsibility hands handson track record tools tool technologies
 technology systems system software applications application products product solutions
 senior junior lead ensure support across within also well new
-apply now description job jobs about looking closely own ll ve re colleague colleagues play
+apply now description job jobs about looking closely own ll ve re colleague colleagues play along alongside
 """.split())
 
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+#_-]*")
@@ -209,7 +209,11 @@ def _tokens(text: str) -> list[str]:
 def _terms(text: str) -> list[str]:
     """Distinctive terms of a text, in order and de-duplicated (no filler words or bare numbers)."""
     out: list[str] = []
-    for t in _tokens(text):
+    for word in _WORD.findall(text):
+        # "must-have", "nice-to-have": a compound made only of filler words is filler too, not an unknown skill
+        if "-" in word and all(_norm(part) in _GENERIC for part in word.split("-") if part):
+            continue
+        t = _norm(word)
         if len(t) >= 2 and not re.fullmatch(r"\d+\+?", t) and t not in _GENERIC and t not in out:
             out.append(t)
     return out
